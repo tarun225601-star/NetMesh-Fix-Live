@@ -68,7 +68,6 @@ services:
   - type: web
     name: netmesh-api
     runtime: node
-    nodeVersion: "24"
 
     buildCommand: >-
       npm install -g pnpm@9 &&
