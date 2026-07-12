@@ -1,37 +1,22 @@
 # render.yaml — NetMesh Render Blueprint
 # ─────────────────────────────────────────────────────────────────────────────
-# Usage: Render Dashboard → "New" → "Blueprint" → point at this repo.
-#        Render reads this file and creates both services automatically.
+# Deploys the NetMesh React/Vite frontend as a Render Static Site.
+# Static Sites are 100% free on Render — no card required.
 #
-# Two services are defined:
-#   1. netmesh      — Vite/React SPA  (Render Static Site — always free)
-#   2. netmesh-api  — Express server  (Render Web Service — free tier available)
+# The Express API server is excluded here because Node.js Web Services require
+# payment details on Render even on the free tier. The frontend is fully
+# self-contained with simulated data and works without the backend.
 #
-# If you only need the frontend right now (it is fully self-contained with
-# mock data), you can delete the netmesh-api block before deploying.
+# Usage: Render Dashboard → New → Blueprint → select this repo.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
-
-  # ── 1. NetMesh Frontend — React + Vite (Static Site) ─────────────────────
-  #
-  # Build output: artifacts/netmesh/dist/public
-  # SPA routing:  wouter handles all client-side paths; the catch-all rewrite
-  #               below ensures unknown paths return index.html instead of 404.
-  #
   - type: web
     name: netmesh
     runtime: static
 
-    # Render's build image ships with Node + npm but NOT pnpm.
-    # We install pnpm@9, then do a frozen install from the checked-in lockfile,
-    # then build only the netmesh workspace package.
-    #
-    # Why PORT=3000 and BASE_PATH=/ here?
-    #   vite.config.ts validates both env vars at config-load time and throws
-    #   if they are missing — even during `vite build`. PORT=3000 is arbitrary
-    #   (the static build never opens a port); BASE_PATH=/ means the app is
-    #   served at the domain root, which is correct for a Render Static Site.
+    # pnpm is not pre-installed on Render; bootstrap it first, then build only
+    # the netmesh workspace package via the pnpm filter flag.
     buildCommand: >-
       npm install -g pnpm@9 &&
       pnpm install --frozen-lockfile &&
@@ -39,8 +24,8 @@ services:
 
     staticPublishPath: ./artifacts/netmesh/dist/public
 
-    # Every URL that does not match a real file is rewritten to index.html so
-    # that wouter can handle it on the client side (hard refresh, deep links).
+    # SPA catch-all: every path that doesn't match a real file gets index.html
+    # so wouter can handle client-side routing (hard refreshes, direct links).
     routes:
       - type: rewrite
         source: /*
@@ -51,42 +36,10 @@ services:
         value: "24"
       - key: NODE_ENV
         value: production
-      # Required by vite.config.ts at build time — value is not baked into output
+      # vite.config.ts validates PORT at config-load time even during `vite build`.
+      # 3000 is a placeholder — the static site never opens a port.
       - key: PORT
         value: "3000"
-      # "/" = app served at the root domain (no sub-path prefix)
+      # "/" means the app is served at the root domain with no sub-path prefix.
       - key: BASE_PATH
         value: "/"
-
-
-  # ── 2. NetMesh API — Express + Node (Web Service) ────────────────────────
-  #
-  # Build:   esbuild bundles src/ → artifacts/api-server/dist/index.mjs
-  # Start:   node runs the bundle; Render injects PORT automatically
-  # Health:  GET /api/healthz → { status: "ok" }
-  #
-  - type: web
-    name: netmesh-api
-    runtime: node
-
-    buildCommand: >-
-      npm install -g pnpm@9 &&
-      pnpm install --frozen-lockfile &&
-      pnpm --filter @workspace/api-server run build
-
-    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
-
-    # Render pings this path after boot to confirm the service is alive.
-    # The route already exists in artifacts/api-server/src/routes/health.ts.
-    healthCheckPath: /api/healthz
-
-    envVars:
-      - key: NODE_VERSION
-        value: "24"
-      - key: NODE_ENV
-        value: production
-      # SESSION_SECRET — do NOT paste the value here.
-      # sync: false means Render will prompt you to enter it in the dashboard
-      # Environment tab before the first deploy runs.
-      - key: SESSION_SECRET
-        sync: false
