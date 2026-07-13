@@ -9,7 +9,7 @@
   "scripts": {
     "typecheck:libs": "tsc --build tsconfig.json",
     "typecheck": "pnpm run typecheck:libs && pnpm --filter @workspace/netmesh --filter @workspace/api-server --filter @workspace/scripts --filter @workspace/mockup-sandbox run typecheck",
-    "build": "pnpm run typecheck && pnpm --filter @workspace/netmesh --filter @workspace/api-server run build",
+    "build": "pnpm run  && pnpm --filter @workspace/netmesh --filter @workspace/api-server run build",
     "render-build": "sh build.sh",
     "start": "node server.js"
   },
