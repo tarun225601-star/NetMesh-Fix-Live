@@ -8,8 +8,8 @@
   },
   "scripts": {
     "typecheck:libs": "tsc --build tsconfig.json",
-    "typecheck": "pnpm run typecheck:libs",
-    "build": "exit 0",
+    "typecheck": "pnpm run typecheck:libs && pnpm --filter @workspace/netmesh --filter @workspace/api-server --filter @workspace/scripts --filter @workspace/mockup-sandbox run typecheck",
+    "build": "sh build.sh",
     "start": "node server.js"
   },
   "devDependencies": {
