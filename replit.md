@@ -2,6 +2,8 @@
 
 A link-sharing and user profile platform. Users can share links, manage their link library, and share a public profile URL with others.
 
+Note: the current UI copy/branding leans into a "P2P internet tunnel" framing (WebRTC relay/worker language) rather than plain link sharing — that's existing product content, not a setup issue.
+
 ## Run & Operate
 
 - `pnpm --filter @workspace/netmesh run dev` — run the frontend (Vite, port from $PORT)

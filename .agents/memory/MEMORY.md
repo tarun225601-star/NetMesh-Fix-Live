@@ -1,0 +1,1 @@
+- [Imported project has artifact.toml but not registered](artifact-reregistration.md) — re-run verifyAndReplaceArtifactToml on each existing artifact.toml to register artifacts/workflows.

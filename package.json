@@ -1,7 +1,13 @@
 {
   "name": "netmesh-fix",
   "version": "1.0.0",
+  "private": true,
   "scripts": {
-    "start": "node -e 'console.log(\"Server is running\")'"
+    "typecheck:libs": "tsc --build tsconfig.json",
+    "typecheck": "pnpm run typecheck:libs && pnpm --filter @workspace/netmesh --filter @workspace/api-server --filter @workspace/scripts --filter @workspace/mockup-sandbox run typecheck",
+    "build": "pnpm run typecheck && pnpm --filter @workspace/netmesh --filter @workspace/api-server run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }
