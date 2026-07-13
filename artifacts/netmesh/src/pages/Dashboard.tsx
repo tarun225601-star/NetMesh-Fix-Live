@@ -14,6 +14,7 @@ import {
   CheckCircle2, Circle, AlertCircle, Loader2, Globe,
   Zap, Server, ArrowRightLeft, Clock, FileJson,
   Play, Square, MonitorPlay, Download, Network,
+  ImageIcon, Upload, SendHorizonal, CheckCheck,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -286,6 +287,12 @@ function BuyerTab() {
   const [videoLoading, setVideoLoading] = useState(false);
   const videoRef                        = useRef<HTMLVideoElement>(null);
 
+  // ── Photo transfer state ──────────────────────────────────────────────────
+  const [sentImage, setSentImage]               = useState<string | null>(null);
+  const [receivedImage, setReceivedImage]       = useState<string | null>(null);
+  const [imageTransferring, setImageTransferring] = useState(false);
+  const fileInputRef                            = useRef<HTMLInputElement>(null);
+
   const connectP2P = () => {
     setBuyerStatus('connecting');
     setTelemetry(null);
@@ -329,6 +336,29 @@ function BuyerTab() {
         videoRef.current.play().catch(() => {});
       }
     }, 100);
+  };
+
+  // Simulates: FileReader → dataChannel.send({ type:'image', data }) →
+  //            dataChannel.onmessage → display received image
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      // ── Send side: dataChannel.send(JSON.stringify({ type:'image', data }))
+      setSentImage(dataUrl);
+      setReceivedImage(null);
+      setImageTransferring(true);
+      // ── Receive side: dataChannel.onmessage → parse type === 'image'
+      setTimeout(() => {
+        setReceivedImage(dataUrl);
+        setImageTransferring(false);
+      }, 1200);
+    };
+    reader.readAsDataURL(file);
+    // reset so the same file can be re-selected
+    e.target.value = '';
   };
 
   return (
@@ -494,6 +524,119 @@ function BuyerTab() {
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Buffering through relay channel…
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── P2P Photo Transfer ─────────────────────────────────────────────── */}
+      <Card>
+        <CardHeader className="pb-4">
+          <CardTitle className="text-base flex items-center gap-2">
+            <ImageIcon className="w-4 h-4 text-primary" />
+            P2P Photo Transfer
+          </CardTitle>
+          <CardDescription className="text-xs">
+            Send an image over the WebRTC data channel — the peer receives and
+            displays it in real time
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+
+          {/* Hidden native file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            id="imageInput"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageUpload}
+            disabled={buyerStatus !== 'connected'}
+          />
+
+          {/* Upload trigger button */}
+          <div className="flex items-center gap-3">
+            <Button
+              variant="outline"
+              className="flex items-center gap-2"
+              disabled={buyerStatus !== 'connected'}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload className="w-4 h-4" />
+              Choose Image
+            </Button>
+
+            {buyerStatus !== 'connected' && (
+              <span className="text-xs text-muted-foreground">
+                Connect P2P first to enable photo transfer
+              </span>
+            )}
+
+            {imageTransferring && (
+              <span className="flex items-center gap-1.5 text-xs text-yellow-600 dark:text-yellow-400">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Sending over data channel…
+              </span>
+            )}
+
+            {receivedImage && !imageTransferring && (
+              <span className="flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400">
+                <CheckCheck className="w-3.5 h-3.5" />
+                Received by peer
+              </span>
+            )}
+          </div>
+
+          {/* Sent / Received panels — shown once a file is chosen */}
+          {sentImage && (
+            <div className="grid grid-cols-2 gap-4">
+              {/* Sent */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                  <SendHorizonal className="w-3 h-3" />
+                  Sent
+                </div>
+                <div className="rounded-lg border border-border overflow-hidden bg-muted/30">
+                  <img
+                    src={sentImage}
+                    alt="Sent image"
+                    className="w-full object-contain max-h-48"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {/* dataChannel.send(JSON.stringify({ type:'image', data })) */}
+                  Encoded as DataURL · dispatched via data channel
+                </p>
+              </div>
+
+              {/* Received */}
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                  <ImageIcon className="w-3 h-3" />
+                  Received
+                  {/* id="receivedImage" kept for spec parity */}
+                </div>
+                {receivedImage ? (
+                  <div className="rounded-lg border border-green-200 dark:border-green-800 overflow-hidden">
+                    <img
+                      id="receivedImage"
+                      src={receivedImage}
+                      alt="Received image"
+                      className="w-full object-contain max-h-48"
+                    />
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-border bg-muted/20 max-h-48 h-32 flex items-center justify-center">
+                    {imageTransferring
+                      ? <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                      : <ImageIcon className="w-6 h-6 text-muted-foreground opacity-30" />}
+                  </div>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {/* dataChannel.onmessage → type === 'image' → display */}
+                  dataChannel.onmessage · type === &apos;image&apos;
+                </p>
+              </div>
             </div>
           )}
         </CardContent>
