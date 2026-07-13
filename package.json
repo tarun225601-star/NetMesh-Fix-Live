@@ -1,15 +1,7 @@
 {
-  "name": "my-project",
-  "version": "0.0.0",
-  "license": "MIT",
+  "name": "netmesh-fix",
+  "version": "1.0.0",
   "scripts": {
-    "build": "echo 'Skipping build'"
-
-  },
-  "dependencies": {
-    "@replit/connectors-sdk": "^0.4.1"
-  },
-  "devDependencies": {
-    "typescript": "~5.9.3"
+    "start": "node -e 'console.log(\"Server is running\")'"
   }
 }
