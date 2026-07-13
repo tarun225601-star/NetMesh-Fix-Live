@@ -12,13 +12,14 @@ services:
     name: netmesh
     runtime: node
 
-    # build.sh: bootstraps pnpm via corepack, installs deps,
-    # builds the Vite frontend, then bundles the Express server.
+    # build.sh: installs deps via `npx pnpm` (no global-bin permissions
+    # required), builds the Vite frontend, then bundles the Express server.
+    # It verifies both build outputs exist before exiting successfully.
     buildCommand: sh build.sh
 
-    # Start the bundled Express server.
+    # Start the bundled Express server via the root entry point.
     # It serves both the API routes (/api/*) and the React SPA (/*).
-    startCommand: node artifacts/api-server/dist/index.mjs
+    startCommand: node server.js
 
     envVars:
       - key: NODE_VERSION
