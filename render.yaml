@@ -17,10 +17,7 @@ services:
 
     # pnpm is not pre-installed on Render; bootstrap it first, then build only
     # the netmesh workspace package via the pnpm filter flag.
-    buildCommand: >-
-      npm install -g pnpm@9 &&
-      pnpm install --frozen-lockfile &&
-      pnpm --filter @workspace/netmesh run build
+    buildCommand: sh build.sh
 
     staticPublishPath: ./artifacts/netmesh/dist/public
 
