@@ -1,11 +1,8 @@
 # render.yaml — NetMesh Render Blueprint
 # ─────────────────────────────────────────────────────────────────────────────
-# Deploys the NetMesh React/Vite frontend as a Render Static Site.
-# Static Sites are 100% free on Render — no card required.
-#
-# The Express API server is excluded here because Node.js Web Services require
-# payment details on Render even on the free tier. The frontend is fully
-# self-contained with simulated data and works without the backend.
+# Deploys the full NetMesh stack as a single Render Web Service:
+#   • Express API server  — REST + WebSocket signaling (/api/*)
+#   • Vite/React frontend — served as static files from the same process (/)
 #
 # Usage: Render Dashboard → New → Blueprint → select this repo.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -13,30 +10,26 @@
 services:
   - type: web
     name: netmesh
-    runtime: static
+    runtime: node
 
-    # pnpm is not pre-installed on Render; bootstrap it first, then build only
-    # the netmesh workspace package via the pnpm filter flag.
+    # build.sh: bootstraps pnpm via corepack, installs deps,
+    # builds the Vite frontend, then bundles the Express server.
     buildCommand: sh build.sh
 
-    staticPublishPath: ./artifacts/netmesh/dist/public
-
-    # SPA catch-all: every path that doesn't match a real file gets index.html
-    # so wouter can handle client-side routing (hard refreshes, direct links).
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+    # Start the bundled Express server.
+    # It serves both the API routes (/api/*) and the React SPA (/*).
+    startCommand: node artifacts/api-server/dist/index.mjs
 
     envVars:
       - key: NODE_VERSION
         value: "24"
       - key: NODE_ENV
         value: production
-      # vite.config.ts validates PORT at config-load time even during `vite build`.
-      # 3000 is a placeholder — the static site never opens a port.
+      # Render assigns the real port at runtime via the PORT env var.
+      # The Express server reads process.env.PORT to bind on the correct port.
       - key: PORT
-        value: "3000"
-      # "/" means the app is served at the root domain with no sub-path prefix.
-      - key: BASE_PATH
-        value: "/"
+        value: "10000"
+      # Cryptographically random secret for session signing.
+      # "generateValue: true" makes Render create it automatically on first deploy.
+      - key: SESSION_SECRET
+        generateValue: true
