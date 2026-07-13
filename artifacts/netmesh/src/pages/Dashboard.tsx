@@ -1,950 +1,808 @@
+/**
+ * NetMesh Dashboard — P2P Internet Tunneling
+ *
+ * Worker mode: acts as the internet relay (answerer).
+ *   1. Registers with the signaling server → receives a session code.
+ *   2. Waits for a Buyer to join.
+ *   3. Completes the WebRTC handshake automatically.
+ *   4. Serves HTTP proxy requests from the Buyer via its own internet.
+ *   5. Keep-alive: pings the DataChannel every 20 s + Screen Wake Lock.
+ *
+ * Buyer mode: consumes the tunnel (offerer).
+ *   1. Enters the Worker's session code → clicks Connect once.
+ *   2. Completes the WebRTC handshake automatically.
+ *   3. Tunnel is live — all test fetches route through the Worker.
+ *   4. Downloads PAC / proxy script for OS-level routing.
+ */
+
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Switch } from '@/components/ui/switch';
-import { Label } from '@/components/ui/label';
-import { Separator } from '@/components/ui/separator';
+import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Progress } from '@/components/ui/progress';
+import { Separator } from '@/components/ui/separator';
 import {
-  Wifi, WifiOff, Activity, Radio, Smartphone, Terminal,
-  CheckCircle2, Circle, AlertCircle, Loader2, Globe,
-  Zap, Server, ArrowRightLeft, Clock, FileJson,
-  Play, Square, MonitorPlay, Download, Network,
-  ImageIcon, Upload, SendHorizonal, CheckCheck,
+  Wifi, WifiOff, Radio, Globe, Loader2, CheckCircle2,
+  AlertCircle, Copy, Download, Terminal, Zap, Shield,
+  ArrowRightLeft, Play, Square, Network, Activity,
+  RefreshCw, Lock, FileCode2, Battery,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { SignalClient } from '@/lib/signal';
+import { WebRTCTunnel, type TunnelPhase, type LogKind } from '@/lib/tunnel';
+import { KeepAliveManager } from '@/lib/keepalive';
+import { generatePAC, downloadPAC, generateProxyScript, downloadScript } from '@/lib/pacfile';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type WorkerStatus = 'idle' | 'ready' | 'awaiting' | 'connecting' | 'connected';
-type BuyerStatus  = 'idle' | 'connecting' | 'connected' | 'failed';
-
-interface Session {
-  id: string;
-  buyerIp: string;
-  startedAt: string;
-  bytesRelayed: number;
-  status: 'active' | 'closed';
-}
-
-interface Telemetry {
-  workerIp: string;
-  bytesRelayed: number;
-  relayTimeMs: number;
-  httpStatus: number | null;
-}
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface LogEntry {
   id: string;
   ts: string;
-  message: string;
-  kind: 'info' | 'success' | 'warn' | 'error';
+  msg: string;
+  kind: LogKind;
 }
 
-interface VideoAsset {
-  name: string;
-  url: string;
-  size: string;
+interface TunnelStats {
+  requests: number;
+  bytes: number;
+  startedAt: Date | null;
+  uptime: string;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-const VIDEO_ASSETS: VideoAsset[] = [
-  {
-    name: "Big Buck Bunny",
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-    size: "158 MB",
-  },
-  {
-    name: "Elephant's Dream",
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
-    size: "54 MB",
-  },
-  {
-    name: "For Bigger Blazes",
-    url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-    size: "11 MB",
-  },
-];
-
-const APK_CHECKLIST = [
-  { label: 'Android SDK configured',        done: true  },
-  { label: 'Capacitor dependencies installed', done: true  },
-  { label: 'WebRTC native bridge ready',    done: true  },
-  { label: 'P2P service manifest declared', done: true  },
-  { label: 'Build signing key',             done: false },
-  { label: 'Play Store release assets',     done: false },
-];
-
-function fakeIp(): string {
-  return `${Math.floor(Math.random()*200)+10}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*254)+1}`;
-}
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function ts()  { return new Date().toLocaleTimeString('en-US', { hour12: false }); }
 
 function fmtBytes(n: number): string {
-  if (n < 1024)       return `${n} B`;
-  if (n < 1048576)    return `${(n/1024).toFixed(1)} KB`;
-  return `${(n/1048576).toFixed(2)} MB`;
+  if (n < 1024)    return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(2)} MB`;
 }
 
-function nowTs(): string {
-  return new Date().toLocaleTimeString('en-US', { hour12: false });
+function fmtUptime(startedAt: Date | null): string {
+  if (!startedAt) return '0s';
+  const s = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+  if (s < 60)   return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
-function uid(): string {
-  return Math.random().toString(36).slice(2, 10);
+function useLogs() {
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const addLog = useCallback((msg: string, kind: LogKind = 'info') => {
+    setLogs(prev => {
+      const next = [...prev, { id: uid(), ts: ts(), msg, kind }];
+      return next.length > 200 ? next.slice(-200) : next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [logs]);
+
+  return { logs, addLog, scrollRef };
 }
 
-// ─── Worker Status Badge ───────────────────────────────────────────────────────
+// ── Phase badge ───────────────────────────────────────────────────────────────
 
-function WorkerStatusBadge({ status }: { status: WorkerStatus }) {
-  const map: Record<WorkerStatus, { label: string; icon: React.ReactNode; cls: string }> = {
-    idle:       { label: 'Offline',          icon: <WifiOff className="w-3 h-3" />,                          cls: 'bg-muted text-muted-foreground' },
-    ready:      { label: 'Ready',            icon: <CheckCircle2 className="w-3 h-3" />,                     cls: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' },
-    awaiting:   { label: 'Awaiting Buyer',   icon: <Loader2 className="w-3 h-3 animate-spin" />,             cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400' },
-    connecting: { label: 'Connecting',       icon: <Activity className="w-3 h-3 animate-pulse" />,           cls: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400' },
-    connected:  { label: 'Connected',        icon: <Wifi className="w-3 h-3" />,                             cls: 'bg-primary/10 text-primary' },
-  };
-  const { label, icon, cls } = map[status];
+const PHASE_META: Record<TunnelPhase | 'awaiting' | 'registering', {
+  label: string; icon: React.ReactNode; cls: string;
+}> = {
+  idle:        { label: 'Offline',         icon: <WifiOff className="w-3 h-3" />,                cls: 'bg-muted text-muted-foreground' },
+  registering: { label: 'Registering…',    icon: <Loader2 className="w-3 h-3 animate-spin" />,   cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400' },
+  awaiting:    { label: 'Awaiting Buyer',  icon: <Radio className="w-3 h-3 animate-pulse" />,    cls: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400' },
+  signaling:   { label: 'Signaling…',      icon: <Loader2 className="w-3 h-3 animate-spin" />,   cls: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400' },
+  connecting:  { label: 'ICE Connecting…', icon: <Activity className="w-3 h-3 animate-pulse" />, cls: 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400' },
+  connected:   { label: 'Tunnel Live',     icon: <Wifi className="w-3 h-3" />,                   cls: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' },
+  failed:      { label: 'Failed',          icon: <AlertCircle className="w-3 h-3" />,             cls: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400' },
+  closed:      { label: 'Closed',          icon: <WifiOff className="w-3 h-3" />,                cls: 'bg-muted text-muted-foreground' },
+};
+
+function PhaseBadge({ phase }: { phase: keyof typeof PHASE_META }) {
+  const m = PHASE_META[phase] ?? PHASE_META.idle;
   return (
-    <span className={cn('inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full', cls)}>
-      {icon}{label}
+    <span className={cn('inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full', m.cls)}>
+      {m.icon}{m.label}
     </span>
   );
 }
 
-// ─── Worker Node Tab ───────────────────────────────────────────────────────────
+// ── Log panel (shared) ────────────────────────────────────────────────────────
+
+const LOG_COLOR: Record<LogKind, string> = {
+  info:    'text-blue-400',
+  success: 'text-green-400',
+  warn:    'text-yellow-400',
+  error:   'text-red-400',
+};
+
+function LogPanel({ logs, scrollRef }: { logs: LogEntry[]; scrollRef: React.RefObject<HTMLDivElement | null> }) {
+  return (
+    <div
+      ref={scrollRef}
+      className="h-44 overflow-y-auto bg-[hsl(222,47%,7%)] rounded-lg p-3 font-mono space-y-0.5"
+    >
+      {logs.length === 0 && (
+        <span className="text-white/30 text-xs">Waiting for events…</span>
+      )}
+      {logs.map(l => (
+        <div key={l.id} className="flex gap-2 text-xs leading-5">
+          <span className="text-white/30 shrink-0 tabular-nums">{l.ts}</span>
+          <span className={cn('break-all', LOG_COLOR[l.kind])}>{l.msg}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Worker Tab ────────────────────────────────────────────────────────────────
 
 function WorkerTab() {
-  const [broadcasting, setBroadcasting] = useState(false);
-  const [status, setStatus]             = useState<WorkerStatus>('idle');
-  const [sessions, setSessions]         = useState<Session[]>([]);
-  const [totalBytes, setTotalBytes]     = useState(0);
-  const intervalRef                     = useRef<ReturnType<typeof setInterval> | null>(null);
+  type WPhase = TunnelPhase | 'awaiting' | 'registering';
 
-  const clearSim = () => {
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    intervalRef.current = null;
+  const [phase, setPhase]         = useState<WPhase>('idle');
+  const [sessionId, setSessionId] = useState('');
+  const [copied, setCopied]       = useState(false);
+  const [stats, setStats]         = useState<TunnelStats>({ requests: 0, bytes: 0, startedAt: null, uptime: '0s' });
+  const [keepAlive, setKeepAlive] = useState({ active: false, wakeLock: false });
+
+  const { logs, addLog, scrollRef } = useLogs();
+
+  const signalRef    = useRef<SignalClient | null>(null);
+  const tunnelRef    = useRef<WebRTCTunnel | null>(null);
+  const keepAliveRef = useRef<KeepAliveManager | null>(null);
+  const uptimeRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Live uptime ticker
+  useEffect(() => {
+    if (phase === 'connected') {
+      uptimeRef.current = setInterval(() => {
+        setStats(s => ({ ...s, uptime: fmtUptime(s.startedAt) }));
+      }, 1000);
+    } else {
+      if (uptimeRef.current) clearInterval(uptimeRef.current);
+    }
+    return () => { if (uptimeRef.current) clearInterval(uptimeRef.current); };
+  }, [phase]);
+
+  const teardown = useCallback(() => {
+    keepAliveRef.current?.stop();
+    keepAliveRef.current = null;
+    tunnelRef.current?.close();
+    tunnelRef.current = null;
+    signalRef.current?.close();
+    signalRef.current = null;
+    setKeepAlive({ active: false, wakeLock: false });
+    if (uptimeRef.current) clearInterval(uptimeRef.current);
+  }, []);
+
+  const start = useCallback(async () => {
+    if (phase !== 'idle' && phase !== 'failed' && phase !== 'closed') return;
+    teardown();
+    setPhase('registering');
+    setStats({ requests: 0, bytes: 0, startedAt: null, uptime: '0s' });
+    addLog('Connecting to signaling server…', 'info');
+
+    const signal = new SignalClient();
+    signalRef.current = signal;
+
+    try {
+      await signal.connect('worker');
+    } catch {
+      addLog('Cannot reach signaling server — is the API server running?', 'error');
+      setPhase('failed');
+      return;
+    }
+
+    addLog('Registered with signaling server', 'success');
+
+    // Handle all signaling messages
+    const tunnel = new WebRTCTunnel();
+    tunnelRef.current = tunnel;
+
+    tunnel.onPhaseChange = (p) => {
+      if (p === 'connected') {
+        const now = new Date();
+        setStats(s => ({ ...s, startedAt: now }));
+      }
+      setPhase(p === 'connecting' ? 'connecting' : p as WPhase);
+    };
+    tunnel.onLog = addLog;
+    tunnel.onStats = (delta) => {
+      setStats(s => ({
+        ...s,
+        requests: s.requests + delta.requests,
+        bytes: s.bytes + delta.bytes,
+      }));
+    };
+
+    signal.onMessage(async (msg) => {
+      if (msg.type === 'registered') {
+        const id = msg.sessionId as string;
+        setSessionId(id);
+        setPhase('awaiting');
+        addLog(`Session code: ${id}`, 'success');
+        addLog('Waiting for a Buyer to connect…', 'info');
+        return;
+      }
+
+      if (msg.type === 'buyer-joined') {
+        addLog('Buyer joined — starting WebRTC handshake…', 'info');
+        setPhase('signaling');
+        return;
+      }
+
+      if (msg.type === 'offer') {
+        addLog('Received SDP offer — generating answer…', 'info');
+        const answer = await tunnel.answerOffer(
+          msg as unknown as RTCSessionDescriptionInit,
+          (ice) => signal.send({ type: 'ice', ...ice }),
+        );
+        signal.send({ type: answer.type, sdp: answer.sdp });
+        addLog('Sent SDP answer — waiting for ICE…', 'info');
+        return;
+      }
+
+      if (msg.type === 'ice') {
+        await tunnel.addIceCandidate(msg as unknown as RTCIceCandidateInit);
+        return;
+      }
+
+      if (msg.type === 'buyer-disconnected') {
+        addLog('Buyer disconnected', 'warn');
+        tunnel.close();
+        setPhase('awaiting');
+        return;
+      }
+
+      if (msg.type === 'error') {
+        addLog(`Signaling error: ${msg.message as string}`, 'error');
+        setPhase('failed');
+      }
+    });
+
+    // Start keep-alive once connected
+    tunnel.onPhaseChange = (p) => {
+      if (p === 'connected' && !keepAliveRef.current) {
+        const ka = new KeepAliveManager();
+        keepAliveRef.current = ka;
+        void ka.start(() => tunnel.ping()).then(() => {
+          setKeepAlive({ active: true, wakeLock: ka.hasWakeLock });
+        });
+        const now = new Date();
+        setStats(s => ({ ...s, startedAt: now }));
+      }
+      if (p === 'connected') setPhase('connected');
+      else if (p === 'connecting') setPhase('connecting');
+      else if (p === 'failed' || p === 'closed') setPhase(p as WPhase);
+    };
+    tunnel.onLog = addLog;
+    tunnel.onStats = (delta) => {
+      setStats(s => ({
+        ...s,
+        requests: s.requests + delta.requests,
+        bytes: s.bytes + delta.bytes,
+      }));
+    };
+
+    signal.onClose(() => {
+      addLog('Signaling connection closed', 'warn');
+    });
+  }, [phase, teardown, addLog]);
+
+  const stop = useCallback(() => {
+    teardown();
+    setPhase('idle');
+    setSessionId('');
+    addLog('Worker stopped', 'warn');
+  }, [teardown, addLog]);
+
+  const copyCode = () => {
+    navigator.clipboard.writeText(sessionId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
   };
 
-  const startBroadcast = () => {
-    setBroadcasting(true);
-    setStatus('ready');
-    // After 1.5 s → awaiting
-    setTimeout(() => setStatus('awaiting'), 1500);
-    // After 4 s → pair with a buyer
-    setTimeout(() => {
-      setStatus('connecting');
-      setTimeout(() => {
-        const newSession: Session = {
-          id: uid(),
-          buyerIp: fakeIp(),
-          startedAt: nowTs(),
-          bytesRelayed: 0,
-          status: 'active',
-        };
-        setSessions(prev => [newSession, ...prev]);
-        setStatus('connected');
-        // Tick bytes every 800 ms
-        intervalRef.current = setInterval(() => {
-          const delta = Math.floor(Math.random() * 12000) + 2000;
-          setTotalBytes(b => b + delta);
-          setSessions(prev =>
-            prev.map(s =>
-              s.id === newSession.id && s.status === 'active'
-                ? { ...s, bytesRelayed: s.bytesRelayed + delta }
-                : s
-            )
-          );
-        }, 800);
-      }, 1200);
-    }, 4000);
-  };
-
-  const stopBroadcast = () => {
-    clearSim();
-    setBroadcasting(false);
-    setStatus('idle');
-    setSessions(prev => prev.map(s => s.status === 'active' ? { ...s, status: 'closed' } : s));
-  };
-
-  useEffect(() => () => clearSim(), []);
-
-  const activeSessions = sessions.filter(s => s.status === 'active').length;
+  const isActive = !['idle', 'failed', 'closed'].includes(phase);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Control card */}
       <Card>
-        <CardHeader className="pb-4">
+        <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div>
               <CardTitle className="text-base flex items-center gap-2">
                 <Radio className="w-4 h-4 text-primary" />
-                Broadcasting Service
+                Worker Node
               </CardTitle>
-              <CardDescription className="mt-1 text-xs">
-                Expose this node as a relay worker on the NetMesh network
+              <CardDescription className="text-xs mt-1">
+                Share your internet connection as a P2P relay
               </CardDescription>
             </div>
-            <WorkerStatusBadge status={status} />
+            <PhaseBadge phase={phase} />
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex items-center gap-3">
-            <Switch
-              id="broadcast-toggle"
-              checked={broadcasting}
-              onCheckedChange={v => (v ? startBroadcast() : stopBroadcast())}
-            />
-            <Label htmlFor="broadcast-toggle" className="text-sm cursor-pointer">
-              {broadcasting ? 'Broadcasting active — accepting buyers' : 'Start broadcasting'}
-            </Label>
+          <div className="flex gap-2">
+            {!isActive ? (
+              <Button className="flex-1" onClick={start}>
+                <Play className="w-4 h-4 mr-2" />
+                Start Worker
+              </Button>
+            ) : (
+              <Button variant="destructive" className="flex-1" onClick={stop}>
+                <Square className="w-4 h-4 mr-2" />
+                Stop Worker
+              </Button>
+            )}
           </div>
 
-          {broadcasting && (
-            <div className="grid grid-cols-3 gap-3 pt-1">
-              {[
-                { label: 'Total Bytes Relayed', value: fmtBytes(totalBytes), icon: <ArrowRightLeft className="w-4 h-4" /> },
-                { label: 'Active Sessions',     value: String(activeSessions), icon: <Wifi className="w-4 h-4" /> },
-                { label: 'Signal State',        value: status.charAt(0).toUpperCase() + status.slice(1), icon: <Activity className="w-4 h-4" /> },
-              ].map(({ label, value, icon }) => (
-                <div key={label} className="rounded-lg border border-border bg-muted/40 p-3 space-y-1">
-                  <div className="text-muted-foreground flex items-center gap-1.5 text-xs">{icon}{label}</div>
-                  <div className="text-lg font-semibold tabular-nums">{value}</div>
-                </div>
-              ))}
+          {/* Session code */}
+          {sessionId && (
+            <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-2">
+              <p className="text-xs text-muted-foreground font-medium uppercase tracking-wider">
+                Session Code — share with Buyer
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-2xl font-mono font-bold text-primary tracking-[0.2em]">
+                  {sessionId}
+                </code>
+                <Button size="sm" variant="outline" onClick={copyCode}>
+                  <Copy className="w-3.5 h-3.5 mr-1" />
+                  {copied ? 'Copied!' : 'Copy'}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Stats row */}
+          {phase === 'connected' && (
+            <div className="grid grid-cols-3 gap-3">
+              <div className="rounded-md border border-border p-3 text-center">
+                <p className="text-xs text-muted-foreground">Requests</p>
+                <p className="text-lg font-mono font-semibold mt-1">{stats.requests}</p>
+              </div>
+              <div className="rounded-md border border-border p-3 text-center">
+                <p className="text-xs text-muted-foreground">Relayed</p>
+                <p className="text-lg font-mono font-semibold mt-1">{fmtBytes(stats.bytes)}</p>
+              </div>
+              <div className="rounded-md border border-border p-3 text-center">
+                <p className="text-xs text-muted-foreground">Uptime</p>
+                <p className="text-lg font-mono font-semibold mt-1">{stats.uptime}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Keep-alive status */}
+          {keepAlive.active && (
+            <div className="flex items-center gap-2 text-xs text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md px-3 py-2">
+              <Battery className="w-3.5 h-3.5" />
+              <span>Keep-alive active — ping every 20 s</span>
+              {keepAlive.wakeLock && (
+                <span className="ml-1 opacity-70">· Screen wake lock held</span>
+              )}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Sessions table */}
+      {/* Live log */}
       <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-            Connection Sessions
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
+            Worker Log
           </CardTitle>
         </CardHeader>
-        <CardContent className="p-0">
-          {sessions.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-muted-foreground gap-2">
-              <Network className="w-8 h-8 opacity-30" />
-              <span className="text-sm">No sessions yet — start broadcasting to accept buyers</span>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-muted/30 text-left text-xs text-muted-foreground uppercase tracking-wider">
-                    <th className="px-4 py-2 font-medium">Session ID</th>
-                    <th className="px-4 py-2 font-medium">Buyer IP</th>
-                    <th className="px-4 py-2 font-medium">Started</th>
-                    <th className="px-4 py-2 font-medium">Bytes Relayed</th>
-                    <th className="px-4 py-2 font-medium">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sessions.map(s => (
-                    <tr key={s.id} className="border-b border-border last:border-0 hover:bg-muted/20 transition-colors">
-                      <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">{s.id}</td>
-                      <td className="px-4 py-2.5 font-mono text-xs">{s.buyerIp}</td>
-                      <td className="px-4 py-2.5 text-xs text-muted-foreground">{s.startedAt}</td>
-                      <td className="px-4 py-2.5 font-mono text-xs tabular-nums">{fmtBytes(s.bytesRelayed)}</td>
-                      <td className="px-4 py-2.5">
-                        <span className={cn(
-                          'text-xs font-medium px-2 py-0.5 rounded-full',
-                          s.status === 'active'
-                            ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400'
-                            : 'bg-muted text-muted-foreground'
-                        )}>
-                          {s.status}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+        <CardContent>
+          <LogPanel logs={logs} scrollRef={scrollRef} />
+        </CardContent>
+      </Card>
+
+      {/* How it works */}
+      <Card className="border-dashed">
+        <CardContent className="pt-5 pb-4 space-y-2 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground flex items-center gap-1.5">
+            <Shield className="w-3.5 h-3.5 text-primary" />How Worker mode works
+          </p>
+          <ul className="space-y-1 ml-5 list-disc">
+            <li>Registers with the signaling server and receives a session code.</li>
+            <li>When a Buyer connects, a WebRTC DataChannel tunnel is established automatically.</li>
+            <li>All HTTP requests from the Buyer are fetched using this device's internet and returned through the tunnel.</li>
+            <li>Keep-alive pings prevent the WebRTC connection from being dropped, even when the phone screen is off.</li>
+          </ul>
         </CardContent>
       </Card>
     </div>
   );
 }
 
-// ─── Network Buyer Tab ─────────────────────────────────────────────────────────
+// ── Buyer Tab ─────────────────────────────────────────────────────────────────
 
 function BuyerTab() {
-  const [buyerStatus, setBuyerStatus]   = useState<BuyerStatus>('idle');
-  const [relayUrl, setRelayUrl]         = useState('https://jsonplaceholder.typicode.com/posts/1');
-  const [telemetry, setTelemetry]       = useState<Telemetry | null>(null);
-  const [fetching, setFetching]         = useState(false);
-  const [activeVideo, setActiveVideo]   = useState<VideoAsset | null>(null);
-  const [videoLoading, setVideoLoading] = useState(false);
-  const videoRef                        = useRef<HTMLVideoElement>(null);
+  type BPhase = TunnelPhase | 'signaling';
 
-  // ── Photo transfer state ──────────────────────────────────────────────────
-  const [sentImage, setSentImage]               = useState<string | null>(null);
-  const [receivedImage, setReceivedImage]       = useState<string | null>(null);
-  const [imageTransferring, setImageTransferring] = useState(false);
-  const fileInputRef                            = useRef<HTMLInputElement>(null);
+  const [phase, setPhase]         = useState<BPhase>('idle');
+  const [code, setCode]           = useState('');
+  const [testUrl, setTestUrl]     = useState('https://api.ipify.org?format=json');
+  const [testResult, setTestResult] = useState<{ status: number; body: string } | null>(null);
+  const [testing, setTesting]     = useState(false);
+  const [sessionId, setSessionId] = useState('');
 
-  const connectP2P = () => {
-    setBuyerStatus('connecting');
-    setTelemetry(null);
-    setTimeout(() => setBuyerStatus('connected'), 2800);
-  };
+  const { logs, addLog, scrollRef } = useLogs();
 
-  const disconnect = () => {
-    setBuyerStatus('idle');
-    setTelemetry(null);
-    setActiveVideo(null);
-  };
+  const signalRef = useRef<SignalClient | null>(null);
+  const tunnelRef = useRef<WebRTCTunnel | null>(null);
 
-  const fetchViaRelay = async () => {
-    if (buyerStatus !== 'connected') return;
-    setFetching(true);
-    const t0 = performance.now();
+  const teardown = useCallback(() => {
+    tunnelRef.current?.close();
+    tunnelRef.current = null;
+    signalRef.current?.close();
+    signalRef.current = null;
+  }, []);
+
+  const connect = useCallback(async () => {
+    const trimmed = code.trim().toUpperCase();
+    if (!trimmed) return;
+    if (phase !== 'idle' && phase !== 'failed' && phase !== 'closed') return;
+
+    teardown();
+    setPhase('signaling');
+    setTestResult(null);
+    addLog(`Connecting to session ${trimmed}…`, 'info');
+
+    const signal = new SignalClient();
+    signalRef.current = signal;
+
     try {
-      const res = await fetch(relayUrl);
-      const ms  = Math.round(performance.now() - t0);
-      const body = await res.text();
-      setTelemetry({
-        workerIp: fakeIp(),
-        bytesRelayed: new TextEncoder().encode(body).length,
-        relayTimeMs: ms,
-        httpStatus: res.status,
-      });
+      await signal.connect('buyer', trimmed);
     } catch {
-      setTelemetry({ workerIp: fakeIp(), bytesRelayed: 0, relayTimeMs: 0, httpStatus: 502 });
-    } finally {
-      setFetching(false);
+      addLog('Cannot reach signaling server — is the API server running?', 'error');
+      setPhase('failed');
+      return;
     }
-  };
 
-  const playVideo = (v: VideoAsset) => {
-    setActiveVideo(v);
-    setVideoLoading(true);
-    // small delay to let <video> mount
-    setTimeout(() => {
-      if (videoRef.current) {
-        videoRef.current.load();
-        videoRef.current.play().catch(() => {});
+    const tunnel = new WebRTCTunnel();
+    tunnelRef.current = tunnel;
+
+    tunnel.onPhaseChange = (p) => {
+      if (p === 'connected') {
+        setPhase('connected');
+        addLog('Tunnel is live — traffic routing through Worker ✓', 'success');
+      } else if (p === 'connecting') {
+        setPhase('connecting');
+      } else if (p === 'failed' || p === 'closed') {
+        setPhase(p);
+        addLog(`Tunnel ${p}`, 'warn');
       }
-    }, 100);
+    };
+    tunnel.onLog = addLog;
+
+    signal.onMessage(async (msg) => {
+      if (msg.type === 'joined') {
+        const sid = msg.sessionId as string;
+        setSessionId(sid);
+        addLog(`Joined session ${sid} — creating offer…`, 'info');
+
+        // Create offer and kick off the handshake automatically
+        const offer = await tunnel.createOffer(
+          (ice) => signal.send({ type: 'ice', ...ice }),
+        );
+        signal.send({ type: offer.type, sdp: offer.sdp });
+        addLog('Sent SDP offer — waiting for Worker answer…', 'info');
+        return;
+      }
+
+      if (msg.type === 'answer') {
+        addLog('Received SDP answer — completing handshake…', 'info');
+        await tunnel.setRemoteAnswer(msg as unknown as RTCSessionDescriptionInit);
+        return;
+      }
+
+      if (msg.type === 'ice') {
+        await tunnel.addIceCandidate(msg as unknown as RTCIceCandidateInit);
+        return;
+      }
+
+      if (msg.type === 'worker-disconnected') {
+        addLog('Worker disconnected', 'warn');
+        setPhase('closed');
+        teardown();
+        return;
+      }
+
+      if (msg.type === 'error') {
+        addLog(`Error: ${msg.message as string}`, 'error');
+        setPhase('failed');
+        teardown();
+      }
+    });
+
+    signal.onClose(() => addLog('Signaling connection closed', 'warn'));
+  }, [code, phase, teardown, addLog]);
+
+  const disconnect = useCallback(() => {
+    teardown();
+    setPhase('idle');
+    setSessionId('');
+    addLog('Disconnected', 'warn');
+  }, [teardown, addLog]);
+
+  const runTest = useCallback(async () => {
+    if (!tunnelRef.current || phase !== 'connected') return;
+    setTesting(true);
+    setTestResult(null);
+    addLog(`Test fetch → ${testUrl}`, 'info');
+    try {
+      const res = await tunnelRef.current.fetch(testUrl);
+      setTestResult({ status: res.status, body: res.body.slice(0, 2000) });
+      addLog(`← ${res.status} ${res.statusText} (${res.body.length} bytes)`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(`Test failed: ${msg}`, 'error');
+      setTestResult({ status: 0, body: `Error: ${msg}` });
+    } finally {
+      setTesting(false);
+    }
+  }, [testUrl, phase, addLog]);
+
+  const handleDownloadPAC = () => {
+    const content = generatePAC('127.0.0.1', 1080, sessionId);
+    downloadPAC(content);
+    addLog('PAC file downloaded', 'info');
   };
 
-  // Simulates: FileReader → dataChannel.send({ type:'image', data }) →
-  //            dataChannel.onmessage → display received image
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      // ── Send side: dataChannel.send(JSON.stringify({ type:'image', data }))
-      setSentImage(dataUrl);
-      setReceivedImage(null);
-      setImageTransferring(true);
-      // ── Receive side: dataChannel.onmessage → parse type === 'image'
-      setTimeout(() => {
-        setReceivedImage(dataUrl);
-        setImageTransferring(false);
-      }, 1200);
-    };
-    reader.readAsDataURL(file);
-    // reset so the same file can be re-selected
-    e.target.value = '';
+  const handleDownloadScript = () => {
+    const content = generateProxyScript('127.0.0.1', 1080);
+    downloadScript(content);
+    addLog('Proxy script downloaded', 'info');
   };
+
+  const isConnecting = phase === 'signaling' || phase === 'connecting';
+  const isConnected  = phase === 'connected';
+  const isActive     = isConnecting || isConnected;
 
   return (
-    <div className="space-y-6">
-      {/* P2P Connection */}
+    <div className="space-y-4">
+      {/* Connection card */}
       <Card>
-        <CardHeader className="pb-4">
+        <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div>
               <CardTitle className="text-base flex items-center gap-2">
                 <Globe className="w-4 h-4 text-primary" />
-                P2P Signaling
+                Network Buyer
               </CardTitle>
               <CardDescription className="text-xs mt-1">
-                Initiate a WebRTC handshake to pair with an active Worker node
+                Route your traffic through a Worker's internet connection
               </CardDescription>
             </div>
-            <span className={cn(
-              'text-xs font-medium px-2.5 py-1 rounded-full inline-flex items-center gap-1.5',
-              buyerStatus === 'idle'       && 'bg-muted text-muted-foreground',
-              buyerStatus === 'connecting' && 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400',
-              buyerStatus === 'connected'  && 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400',
-              buyerStatus === 'failed'     && 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400',
-            )}>
-              {buyerStatus === 'idle'       && <><WifiOff className="w-3 h-3" />Disconnected</>}
-              {buyerStatus === 'connecting' && <><Loader2 className="w-3 h-3 animate-spin" />Connecting…</>}
-              {buyerStatus === 'connected'  && <><Wifi className="w-3 h-3" />Connected</>}
-              {buyerStatus === 'failed'     && <><AlertCircle className="w-3 h-3" />Failed</>}
-            </span>
+            <PhaseBadge phase={phase} />
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex gap-2">
-            {buyerStatus !== 'connected' ? (
+            <Input
+              placeholder="Session code  e.g. ALPHA-4821"
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              onKeyDown={(e) => e.key === 'Enter' && !isActive && connect()}
+              disabled={isActive}
+              className="font-mono tracking-wider"
+            />
+            {!isConnected ? (
               <Button
-                onClick={connectP2P}
-                disabled={buyerStatus === 'connecting'}
-                className="flex items-center gap-2"
+                className="shrink-0"
+                onClick={connect}
+                disabled={isConnecting || !code.trim()}
               >
-                {buyerStatus === 'connecting'
-                  ? <><Loader2 className="w-4 h-4 animate-spin" />Pairing with Worker…</>
-                  : <><Zap className="w-4 h-4" />Connect P2P</>}
+                {isConnecting
+                  ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Connecting…</>
+                  : <><Wifi className="w-4 h-4 mr-2" />Connect</>}
               </Button>
             ) : (
-              <Button variant="outline" onClick={disconnect} className="flex items-center gap-2">
-                <Square className="w-4 h-4" />
+              <Button variant="destructive" className="shrink-0" onClick={disconnect}>
+                <WifiOff className="w-4 h-4 mr-2" />
                 Disconnect
               </Button>
             )}
           </div>
 
-          {/* Relay URL fetch */}
-          <Separator />
-          <div className="space-y-2">
-            <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Relay URL Request
-            </Label>
-            <div className="flex gap-2">
-              <Input
-                value={relayUrl}
-                onChange={e => setRelayUrl(e.target.value)}
-                placeholder="https://…"
-                className="font-mono text-xs flex-1"
-                disabled={buyerStatus !== 'connected'}
-              />
-              <Button
-                onClick={fetchViaRelay}
-                disabled={buyerStatus !== 'connected' || fetching}
-                variant="secondary"
-                className="shrink-0 flex items-center gap-1.5"
-              >
-                {fetching ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-                {fetching ? 'Relaying…' : 'Connect to High-Speed Net'}
-              </Button>
-            </div>
-          </div>
-
-          {/* Telemetry row */}
-          {telemetry && (
-            <div className="grid grid-cols-4 gap-3 pt-1">
-              {[
-                { label: 'Worker IP',     value: telemetry.workerIp,                 icon: <Server className="w-3.5 h-3.5" /> },
-                { label: 'Bytes Relayed', value: fmtBytes(telemetry.bytesRelayed),   icon: <ArrowRightLeft className="w-3.5 h-3.5" /> },
-                { label: 'Relay Time',    value: `${telemetry.relayTimeMs} ms`,       icon: <Clock className="w-3.5 h-3.5" /> },
-                { label: 'HTTP Status',   value: String(telemetry.httpStatus ?? '—'), icon: <Activity className="w-3.5 h-3.5" /> },
-              ].map(({ label, value, icon }) => (
-                <div key={label} className="rounded-lg border border-border bg-muted/40 p-3 space-y-1">
-                  <div className="text-muted-foreground flex items-center gap-1 text-xs">{icon}{label}</div>
-                  <div className={cn(
-                    'font-mono text-sm font-semibold tabular-nums',
-                    label === 'HTTP Status' && telemetry.httpStatus === 200 && 'text-green-600 dark:text-green-400',
-                    label === 'HTTP Status' && telemetry.httpStatus !== 200 && 'text-red-600 dark:text-red-400',
-                  )}>
-                    {value}
-                  </div>
-                </div>
-              ))}
+          {/* Connected state: tunnel active indicator */}
+          {isConnected && (
+            <div className="flex items-center gap-2 text-xs text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md px-3 py-2">
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              <span className="font-medium">Tunnel live</span>
+              <span className="opacity-70">· HTTP traffic routing through Worker · Session {sessionId}</span>
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Video Relay Test */}
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle className="text-base flex items-center gap-2">
-            <MonitorPlay className="w-4 h-4 text-primary" />
-            Video Relay Test
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Stream open-source test assets through the active relay worker
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {/* Asset buttons */}
-          <div className="flex flex-wrap gap-2">
-            {VIDEO_ASSETS.map(v => (
-              <Button
-                key={v.name}
-                variant={activeVideo?.name === v.name ? 'default' : 'outline'}
-                size="sm"
-                className="flex items-center gap-2 text-xs"
-                disabled={buyerStatus !== 'connected'}
-                onClick={() => playVideo(v)}
-              >
-                <Play className="w-3.5 h-3.5" />
-                {v.name}
-                <span className="text-muted-foreground text-xs">({v.size})</span>
-              </Button>
-            ))}
-          </div>
-
-          {/* Video player */}
-          {activeVideo ? (
-            <div className="rounded-lg overflow-hidden border border-border bg-black aspect-video">
-              <video
-                ref={videoRef}
-                className="w-full h-full"
-                controls
-                onLoadedData={() => setVideoLoading(false)}
-                onWaiting={() => setVideoLoading(true)}
-                onPlaying={() => setVideoLoading(false)}
-                key={activeVideo.url}
-              >
-                <source src={activeVideo.url} type="video/mp4" />
-              </video>
-            </div>
-          ) : (
-            <div className={cn(
-              'rounded-lg border border-dashed border-border aspect-video flex flex-col items-center justify-center gap-2 text-muted-foreground',
-              buyerStatus !== 'connected' && 'opacity-50'
-            )}>
-              <MonitorPlay className="w-10 h-10 opacity-30" />
-              <span className="text-sm">
-                {buyerStatus === 'connected'
-                  ? 'Select a video asset above to begin relay test'
-                  : 'Connect P2P first to enable video relay'}
-              </span>
-            </div>
-          )}
-
-          {videoLoading && (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Buffering through relay channel…
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* ── P2P Photo Transfer ─────────────────────────────────────────────── */}
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle className="text-base flex items-center gap-2">
-            <ImageIcon className="w-4 h-4 text-primary" />
-            P2P Photo Transfer
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Send an image over the WebRTC data channel — the peer receives and
-            displays it in real time
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-
-          {/* Hidden native file input */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            id="imageInput"
-            accept="image/*"
-            className="hidden"
-            onChange={handleImageUpload}
-            disabled={buyerStatus !== 'connected'}
-          />
-
-          {/* Upload trigger button */}
-          <div className="flex items-center gap-3">
-            <Button
-              variant="outline"
-              className="flex items-center gap-2"
-              disabled={buyerStatus !== 'connected'}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload className="w-4 h-4" />
-              Choose Image
-            </Button>
-
-            {buyerStatus !== 'connected' && (
-              <span className="text-xs text-muted-foreground">
-                Connect P2P first to enable photo transfer
-              </span>
-            )}
-
-            {imageTransferring && (
-              <span className="flex items-center gap-1.5 text-xs text-yellow-600 dark:text-yellow-400">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Sending over data channel…
-              </span>
-            )}
-
-            {receivedImage && !imageTransferring && (
-              <span className="flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400">
-                <CheckCheck className="w-3.5 h-3.5" />
-                Received by peer
-              </span>
-            )}
-          </div>
-
-          {/* Sent / Received panels — shown once a file is chosen */}
-          {sentImage && (
-            <div className="grid grid-cols-2 gap-4">
-              {/* Sent */}
-              <div className="space-y-2">
-                <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  <SendHorizonal className="w-3 h-3" />
-                  Sent
-                </div>
-                <div className="rounded-lg border border-border overflow-hidden bg-muted/30">
-                  <img
-                    src={sentImage}
-                    alt="Sent image"
-                    className="w-full object-contain max-h-48"
-                  />
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {/* dataChannel.send(JSON.stringify({ type:'image', data })) */}
-                  Encoded as DataURL · dispatched via data channel
-                </p>
-              </div>
-
-              {/* Received */}
-              <div className="space-y-2">
-                <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  <ImageIcon className="w-3 h-3" />
-                  Received
-                  {/* id="receivedImage" kept for spec parity */}
-                </div>
-                {receivedImage ? (
-                  <div className="rounded-lg border border-green-200 dark:border-green-800 overflow-hidden">
-                    <img
-                      id="receivedImage"
-                      src={receivedImage}
-                      alt="Received image"
-                      className="w-full object-contain max-h-48"
-                    />
-                  </div>
-                ) : (
-                  <div className="rounded-lg border border-dashed border-border bg-muted/20 max-h-48 h-32 flex items-center justify-center">
-                    {imageTransferring
-                      ? <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
-                      : <ImageIcon className="w-6 h-6 text-muted-foreground opacity-30" />}
-                  </div>
-                )}
-                <p className="text-xs text-muted-foreground">
-                  {/* dataChannel.onmessage → type === 'image' → display */}
-                  dataChannel.onmessage · type === &apos;image&apos;
-                </p>
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-// ─── Android Engine Tab ────────────────────────────────────────────────────────
-
-function AndroidTab() {
-  const [generated, setGenerated] = useState(false);
-
-  const generateConfig = () => {
-    const config = {
-      appId: 'com.netmesh.p2p',
-      appName: 'NetMesh',
-      webDir: 'dist',
-      server: {
-        androidScheme: 'https',
-        cleartext: false,
-      },
-      plugins: {
-        SplashScreen: {
-          launchShowDuration: 2000,
-          backgroundColor: '#0f172a',
-          androidSplashResourceName: 'splash',
-          androidScaleType: 'CENTER_CROP',
-        },
-      },
-      android: {
-        buildOptions: {
-          keystorePath: './release.keystore',
-          keystoreAlias: 'netmesh',
-        },
-      },
-    };
-
-    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = 'capacitor.config.json';
-    a.click();
-    URL.revokeObjectURL(url);
-    setGenerated(true);
-  };
-
-  const completedCount = APK_CHECKLIST.filter(i => i.done).length;
-  const progress       = Math.round((completedCount / APK_CHECKLIST.length) * 100);
-
-  return (
-    <div className="space-y-6">
-      {/* Header card */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-base flex items-center gap-2">
-                <Smartphone className="w-4 h-4 text-primary" />
-                Android Build Engine
-              </CardTitle>
-              <CardDescription className="text-xs mt-1">
-                Capacitor-based APK compilation pipeline for NetMesh P2P
-              </CardDescription>
-            </div>
-            <Button
-              onClick={generateConfig}
-              variant={generated ? 'secondary' : 'default'}
-              size="sm"
-              className="flex items-center gap-2 text-xs shrink-0"
-            >
-              {generated
-                ? <><CheckCircle2 className="w-3.5 h-3.5" />Config Generated</>
-                : <><FileJson className="w-3.5 h-3.5" />Generate Android Asset Config</>}
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {/* Compilation status banner */}
-          <div className="flex items-center gap-3 rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30 px-4 py-3">
-            <CheckCircle2 className="w-5 h-5 text-green-600 dark:text-green-400 shrink-0" />
-            <div>
-              <div className="text-sm font-semibold text-green-800 dark:text-green-300">Ready for Compilation</div>
-              <div className="text-xs text-green-700 dark:text-green-500 mt-0.5">
-                Core P2P modules compiled · WebRTC bridge linked · {completedCount}/{APK_CHECKLIST.length} pre-flight checks passed
-              </div>
-            </div>
-          </div>
-
-          {/* Progress */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>Deployment readiness</span>
-              <span className="tabular-nums">{progress}%</span>
-            </div>
-            <Progress value={progress} className="h-2" />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* APK blueprint checklist */}
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-            APK Deployment Blueprint
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {APK_CHECKLIST.map(({ label, done }) => (
-            <div
-              key={label}
-              className={cn(
-                'flex items-center gap-3 rounded-lg px-3 py-2.5 border text-sm transition-colors',
-                done
-                  ? 'border-green-200 dark:border-green-900 bg-green-50/60 dark:bg-green-950/20'
-                  : 'border-border bg-muted/30'
-              )}
-            >
-              {done
-                ? <CheckCircle2 className="w-4 h-4 text-green-600 dark:text-green-400 shrink-0" />
-                : <Circle className="w-4 h-4 text-muted-foreground/40 shrink-0" />}
-              <span className={done ? 'text-foreground' : 'text-muted-foreground'}>
-                {label}
-              </span>
-              <span className="ml-auto text-xs">
-                {done
-                  ? <span className="text-green-600 dark:text-green-400 font-medium">Done</span>
-                  : <span className="text-muted-foreground">Pending</span>}
-              </span>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      {/* Config preview */}
-      {generated && (
+      {/* Test request panel — shown only when connected */}
+      {isConnected && (
         <Card>
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Download className="w-4 h-4 text-primary" />
-              capacitor.config.json — downloaded
+            <CardTitle className="text-sm flex items-center gap-2">
+              <ArrowRightLeft className="w-3.5 h-3.5 text-primary" />
+              Tunnel Test — Fetch via Worker
             </CardTitle>
+            <CardDescription className="text-xs">
+              Send a real HTTP request through the DataChannel tunnel
+            </CardDescription>
           </CardHeader>
-          <CardContent>
-            <pre className="text-xs font-mono bg-muted/60 rounded-lg p-4 overflow-x-auto text-muted-foreground leading-relaxed">
-{`{
-  "appId": "com.netmesh.p2p",
-  "appName": "NetMesh",
-  "webDir": "dist",
-  "server": { "androidScheme": "https" },
-  "plugins": { "SplashScreen": { ... } }
-}`}
-            </pre>
+          <CardContent className="space-y-3">
+            <div className="flex gap-2">
+              <Input
+                value={testUrl}
+                onChange={(e) => setTestUrl(e.target.value)}
+                placeholder="https://api.ipify.org?format=json"
+                className="font-mono text-xs"
+              />
+              <Button size="sm" onClick={runTest} disabled={testing}>
+                {testing
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <RefreshCw className="w-3.5 h-3.5" />}
+                <span className="ml-1.5">{testing ? 'Fetching…' : 'Fetch'}</span>
+              </Button>
+            </div>
+
+            {testResult && (
+              <div className="rounded-lg border border-border overflow-hidden">
+                <div className={cn(
+                  'px-3 py-1.5 text-xs font-mono font-medium flex items-center gap-2',
+                  testResult.status >= 200 && testResult.status < 300
+                    ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
+                    : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+                )}>
+                  <Zap className="w-3 h-3" />
+                  HTTP {testResult.status} — via WebRTC DataChannel ✓
+                </div>
+                <pre className="p-3 text-xs font-mono bg-muted/30 overflow-x-auto whitespace-pre-wrap break-all max-h-40">
+                  {testResult.body}
+                </pre>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
+
+      {/* OS proxy config — shown only when connected */}
+      {isConnected && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Lock className="w-3.5 h-3.5 text-primary" />
+              OS-Level Proxy Config
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Route all device traffic through the tunnel using a PAC file or proxy script
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              <Button variant="outline" size="sm" className="flex gap-2" onClick={handleDownloadPAC}>
+                <Download className="w-3.5 h-3.5" />
+                Download PAC File
+              </Button>
+              <Button variant="outline" size="sm" className="flex gap-2" onClick={handleDownloadScript}>
+                <FileCode2 className="w-3.5 h-3.5" />
+                Download Proxy Script
+              </Button>
+            </div>
+
+            <div className="rounded-md border border-border bg-muted/20 p-3 space-y-2 text-xs">
+              <p className="font-medium">Manual proxy settings (applies to browsers):</p>
+              <div className="font-mono space-y-1 text-muted-foreground">
+                <div className="flex gap-2"><span className="text-foreground w-14">SOCKS5</span> 127.0.0.1 : 1080</div>
+                <div className="flex gap-2"><span className="text-foreground w-14">HTTP</span>  127.0.0.1 : 8118</div>
+              </div>
+              <Separator />
+              <p className="text-muted-foreground">
+                The PAC file routes all non-local traffic through the Worker.
+                The shell script configures system-level proxy on macOS / Linux.
+                For Android: Settings → Wi-Fi → Proxy → Manual.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Live log */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
+            Buyer Log
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <LogPanel logs={logs} scrollRef={scrollRef} />
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
-// ─── Network Topology Log ──────────────────────────────────────────────────────
+// ── Dashboard (default export) ────────────────────────────────────────────────
 
-function TopologyLog() {
-  const [logs, setLogs]     = useState<LogEntry[]>([]);
-  const [running, setRunning] = useState(true);
-  const scrollRef           = useRef<HTMLDivElement>(null);
-  const intervalRef         = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const LOG_TEMPLATES = [
-    (b: string, w: string) => ({ msg: `Buyer [${b}] → Server → Worker [${w}] → Internet ✓ HTTP 200`, kind: 'success' as const }),
-    (b: string, w: string) => ({ msg: `NEW_SESSION buyer=${b} worker=${w} latency=${Math.floor(Math.random()*60)+10}ms`, kind: 'info' as const }),
-    (b: string, w: string) => ({ msg: `RELAY bytes=${fmtBytes(Math.floor(Math.random()*50000)+1000)} worker=${w}`, kind: 'info' as const }),
-    (b: string, _w: string) => ({ msg: `HEARTBEAT buyer=${b} pong=OK`, kind: 'info' as const }),
-    (b: string, w: string) => ({ msg: `SIGNALING offer → answer SDP exchanged [${b} ↔ ${w}]`, kind: 'info' as const }),
-    (b: string, w: string) => ({ msg: `ICE candidate pair nominated [${b}:${Math.floor(Math.random()*30000)+1024}] ↔ [${w}:${Math.floor(Math.random()*30000)+1024}]`, kind: 'info' as const }),
-    (_b: string, w: string) => ({ msg: `WORKER [${w}] CPU 12% MEM 38% bandwidth OK`, kind: 'info' as const }),
-    (b: string, w: string) => ({ msg: `SESSION CLOSED buyer=${b} worker=${w} total=${fmtBytes(Math.floor(Math.random()*2000000)+50000)}`, kind: 'warn' as const }),
-  ];
-
-  const addLog = useCallback(() => {
-    const b = fakeIp();
-    const w = fakeIp();
-    const tpl = LOG_TEMPLATES[Math.floor(Math.random() * LOG_TEMPLATES.length)];
-    const { msg, kind } = tpl(b, w);
-    setLogs(prev => {
-      const next = [...prev, { id: uid(), ts: nowTs(), message: msg, kind }];
-      return next.length > 120 ? next.slice(-120) : next;
-    });
-  }, []);
-
-  useEffect(() => {
-    if (running) {
-      addLog();
-      intervalRef.current = setInterval(addLog, 1600);
-    } else {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [running, addLog]);
-
-  // Auto-scroll
-  useEffect(() => {
-    if (scrollRef.current && running) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [logs, running]);
-
-  const kindColor: Record<LogEntry['kind'], string> = {
-    info:    'text-blue-400',
-    success: 'text-green-400',
-    warn:    'text-yellow-400',
-    error:   'text-red-400',
-  };
-
-  return (
-    <div className="border-t border-border bg-[hsl(222,47%,8%)] dark:bg-[hsl(222,47%,7%)]">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-white/10">
-        <div className="flex items-center gap-2">
-          <Terminal className="w-3.5 h-3.5 text-green-400" />
-          <span className="text-xs font-mono text-green-400 font-medium">Network Topology Log</span>
-          {running && (
-            <span className="flex items-center gap-1 text-xs text-green-500/70">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-              LIVE
-            </span>
-          )}
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-xs h-6 px-2 text-white/60 hover:text-white hover:bg-white/10"
-          onClick={() => setRunning(r => !r)}
-        >
-          {running ? <><Square className="w-3 h-3 mr-1" />Pause</> : <><Play className="w-3 h-3 mr-1" />Resume</>}
-        </Button>
-      </div>
-      <div ref={scrollRef} className="h-36 overflow-y-auto px-4 py-2 space-y-0.5 font-mono">
-        {logs.map(l => (
-          <div key={l.id} className="flex gap-2 text-xs leading-5">
-            <span className="text-white/30 shrink-0 tabular-nums">{l.ts}</span>
-            <span className={cn('break-all', kindColor[l.kind])}>{l.message}</span>
-          </div>
-        ))}
-        {logs.length === 0 && (
-          <div className="text-white/30 text-xs py-2">Waiting for network events…</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── Dashboard (default export) ────────────────────────────────────────────────
+type Mode = 'worker' | 'buyer';
 
 export default function Dashboard() {
+  const [mode, setMode] = useState<Mode>('worker');
+
   return (
     <div className="flex flex-col h-full">
-      {/* Top header bar */}
+      {/* Header */}
       <div className="px-6 py-4 border-b border-border shrink-0">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-3">
           <div>
             <h1 className="text-lg font-semibold flex items-center gap-2">
               <Network className="w-5 h-5 text-primary" />
-              NetMesh Control Panel
+              NetMesh · P2P Internet Tunnel
             </h1>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Peer-to-peer internet sharing · WebRTC signaling
+              WebRTC DataChannel · End-to-end encrypted · No central server
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-            <span className="text-xs text-muted-foreground">Signaling server reachable</span>
+          <div className="flex items-center gap-1.5">
+            <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+            <span className="text-xs text-muted-foreground">Signaling server online</span>
           </div>
         </div>
       </div>
 
-      {/* Tabs content */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="p-6">
-          <Tabs defaultValue="worker" className="space-y-6">
-            <TabsList className="grid grid-cols-3 w-full max-w-md">
-              <TabsTrigger value="worker" className="flex items-center gap-1.5 text-xs">
-                <Radio className="w-3.5 h-3.5" />Worker Node
-              </TabsTrigger>
-              <TabsTrigger value="buyer" className="flex items-center gap-1.5 text-xs">
-                <Globe className="w-3.5 h-3.5" />Network Buyer
-              </TabsTrigger>
-              <TabsTrigger value="android" className="flex items-center gap-1.5 text-xs">
-                <Smartphone className="w-3.5 h-3.5" />Android Engine
-              </TabsTrigger>
-            </TabsList>
+      {/* Mode selector */}
+      <div className="px-6 pt-5 pb-0 shrink-0">
+        <div className="grid grid-cols-2 gap-3 max-w-md">
+          <button
+            onClick={() => setMode('worker')}
+            className={cn(
+              'flex flex-col items-start gap-1 rounded-xl border-2 p-4 text-left transition-all',
+              mode === 'worker'
+                ? 'border-primary bg-primary/5'
+                : 'border-border hover:border-primary/40',
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <Radio className={cn('w-4 h-4', mode === 'worker' ? 'text-primary' : 'text-muted-foreground')} />
+              <span className="text-sm font-semibold">Worker</span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Share your internet · Act as the relay node
+            </p>
+          </button>
 
-            <TabsContent value="worker" className="mt-0">
-              <WorkerTab />
-            </TabsContent>
-            <TabsContent value="buyer" className="mt-0">
-              <BuyerTab />
-            </TabsContent>
-            <TabsContent value="android" className="mt-0">
-              <AndroidTab />
-            </TabsContent>
-          </Tabs>
+          <button
+            onClick={() => setMode('buyer')}
+            className={cn(
+              'flex flex-col items-start gap-1 rounded-xl border-2 p-4 text-left transition-all',
+              mode === 'buyer'
+                ? 'border-primary bg-primary/5'
+                : 'border-border hover:border-primary/40',
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <Globe className={cn('w-4 h-4', mode === 'buyer' ? 'text-primary' : 'text-muted-foreground')} />
+              <span className="text-sm font-semibold">Buyer</span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Use shared internet · Connect to a Worker
+            </p>
+          </button>
         </div>
       </div>
 
-      {/* Fixed bottom: Network Topology Log */}
-      <div className="shrink-0">
-        <TopologyLog />
+      {/* Tab content */}
+      <div className="flex-1 overflow-y-auto px-6 py-5">
+        {mode === 'worker' ? <WorkerTab /> : <BuyerTab />}
       </div>
     </div>
   );

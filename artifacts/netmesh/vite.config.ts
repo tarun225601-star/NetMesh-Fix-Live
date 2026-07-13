@@ -27,6 +27,10 @@ if (!basePath) {
   );
 }
 
+// Port of the API server — Replit assigns it; 8080 is the usual value.
+// Override by setting API_SERVER_PORT in the netmesh artifact's env vars.
+const apiServerPort = Number(process.env.API_SERVER_PORT ?? 8080);
+
 export default defineConfig({
   base: basePath,
   plugins: [
@@ -71,6 +75,17 @@ export default defineConfig({
     allowedHosts: true,
     fs: {
       strict: true,
+    },
+    proxy: {
+      // Proxy both HTTP API calls and WebSocket upgrades to the API server.
+      // WebSocket requests to /api/ws/signal are handled by the same target.
+      [`${basePath}/api`]: {
+        target: `http://localhost:${apiServerPort}`,
+        changeOrigin: true,
+        ws: true,
+        // Rewrite: /netmesh/api/... → /api/...
+        rewrite: (p) => p.replace(new RegExp(`^${basePath}`), ''),
+      },
     },
   },
   preview: {
