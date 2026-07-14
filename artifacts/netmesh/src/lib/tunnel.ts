@@ -74,6 +74,10 @@ export class WebRTCTunnel {
   private dc: RTCDataChannel | null = null;
   private pending = new Map<string, (r: ProxyResponse) => void>();
   private statsTimer: ReturnType<typeof setInterval> | null = null;
+  /** Only the Worker measures getStats() and broadcasts the figure — the
+   *  Buyer just displays whatever the Worker sends, so both sides always
+   *  show the exact same number instead of two independently-measured ones. */
+  private role: "worker" | "buyer" | null = null;
 
   // Callbacks set by the consumer
   onPhaseChange: (phase: TunnelPhase) => void = () => {};
@@ -139,6 +143,7 @@ export class WebRTCTunnel {
 
   private startStatsPolling() {
     if (this.statsTimer) return;
+    if (this.role !== "worker") return; // Buyer receives usage via "data-usage" messages instead
     void this.pollStats(); // immediate first read
     this.statsTimer = setInterval(() => void this.pollStats(), 2_000);
   }
@@ -150,6 +155,9 @@ export class WebRTCTunnel {
 
   private async pollStats() {
     if (!this.pc) return;
+    // Only the Worker measures — the Buyer receives the number via the
+    // "data-usage" message instead, so both sides are always in sync.
+    if (this.role !== "worker") return;
     try {
       const report = await this.pc.getStats();
       let dataChannelBytes = 0;
@@ -173,6 +181,11 @@ export class WebRTCTunnel {
 
       const total = dataChannelBytes > 0 ? dataChannelBytes : candidatePairBytes;
       this.onDataUsage(total);
+      // Sync the "Total Data Shared" figure to the Buyer in real time so
+      // both UIs always show the exact same number.
+      if (this.dc?.readyState === "open") {
+        this.dc.send(JSON.stringify({ type: "data-usage", totalBytes: total }));
+      }
     } catch {
       // getStats() can throw transiently during ICE renegotiation — ignore.
     }
@@ -220,6 +233,12 @@ export class WebRTCTunnel {
 
     if (type === "network-info") {
       this.onNetworkInfo((msg as unknown as { provider: string }).provider);
+      return;
+    }
+
+    if (type === "data-usage") {
+      // Buyer side: display the Worker's authoritative, live-measured total.
+      this.onDataUsage((msg as unknown as { totalBytes: number }).totalBytes);
     }
   }
 
@@ -287,6 +306,7 @@ export class WebRTCTunnel {
     pc.ondatachannel = (e) => this.wireDataChannel(e.channel);
     pc.onicecandidate = (e) => { if (e.candidate) onIce(e.candidate.toJSON()); };
 
+    this.role = "worker";
     await pc.setRemoteDescription(offer);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -301,6 +321,7 @@ export class WebRTCTunnel {
    * Returns the SDP offer to be sent through signaling.
    */
   async createOffer(onIce: (c: RTCIceCandidateInit) => void): Promise<RTCSessionDescriptionInit> {
+    this.role = "buyer";
     const pc = this.buildPC();
     const dc = pc.createDataChannel("tunnel", { ordered: true });
     this.wireDataChannel(dc);

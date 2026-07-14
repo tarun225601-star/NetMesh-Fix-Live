@@ -72,6 +72,17 @@ function fmtBytes(n: number): string {
   return `${(n / 1048576).toFixed(2)} MB`;
 }
 
+/** Always in MB, per the "Usage: [X] MB" label spec. */
+function fmtMB(n: number): string {
+  return (n / 1048576).toFixed(2);
+}
+
+/** "Mobile Data: Airtel" or "Wi-Fi" — the shared Connection Type label. */
+function fmtConnectionType(provider: string): string {
+  if (!provider) return 'Unknown';
+  return provider === 'Wi-Fi' ? 'Wi-Fi' : `Mobile Data: ${provider}`;
+}
+
 function fmtUptime(startedAt: Date | null): string {
   if (!startedAt) return '0s';
   const s = Math.floor((Date.now() - startedAt.getTime()) / 1000);
@@ -442,7 +453,7 @@ function WorkerTab() {
         </CardContent>
       </Card>
 
-      {/* Network Monitor */}
+      {/* Network Monitor — shared, live-synced with the Buyer over the DataChannel */}
       {phase === 'connected' && (
         <Card>
           <CardHeader className="pb-2">
@@ -450,22 +461,25 @@ function WorkerTab() {
               <SignalHigh className="w-3.5 h-3.5 text-muted-foreground" />
               Network Monitor
             </CardTitle>
+            <CardDescription className="text-xs">
+              Shared live with the Buyer — both screens show identical numbers
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Wifi className="w-3.5 h-3.5" />Relaying on
+                <Wifi className="w-3.5 h-3.5" />Connection Type
               </span>
-              <Badge variant="secondary">{networkProvider}</Badge>
+              <Badge variant="secondary">{fmtConnectionType(networkProvider)}</Badge>
             </div>
             <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Gauge className="w-3.5 h-3.5" />Data Used (this session)
+                <Gauge className="w-3.5 h-3.5" />Total Data Shared
               </span>
               <span className="text-sm font-mono font-semibold">{fmtBytes(dataUsed)}</span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Measured live from the WebRTC connection — resets only when the Worker stops or the Buyer disconnects.
+              Measured live from the WebRTC tunnel and synced to the Buyer in real time — resets only when the Worker stops or the Buyer disconnects.
             </p>
           </CardContent>
         </Card>
@@ -711,18 +725,19 @@ function BuyerTab() {
             </div>
           )}
 
-          {/* Connected-to network label */}
+          {/* Connected-to network label — required format: "Connected to [Worker's Network Name] | Usage: [X] MB" */}
           {isConnected && (
             <div className="flex items-center gap-2 text-xs font-medium text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-md px-3 py-2">
-              <SignalHigh className="w-3.5 h-3.5" />
-              <span>Connected to: {connectedNetwork || 'Awaiting network info…'}</span>
-              <span className="opacity-70 font-normal">— you're using the Worker's mobile data</span>
+              <SignalHigh className="w-3.5 h-3.5 shrink-0" />
+              <span className="font-mono">
+                Connected to {connectedNetwork || 'Awaiting network info…'} | Usage: {fmtMB(dataUsed)} MB
+              </span>
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Network Monitor */}
+      {/* Network Monitor — same figures as the Worker, synced live over the DataChannel */}
       {isConnected && (
         <Card>
           <CardHeader className="pb-2">
@@ -730,17 +745,20 @@ function BuyerTab() {
               <SignalHigh className="w-3.5 h-3.5 text-muted-foreground" />
               Network Monitor
             </CardTitle>
+            <CardDescription className="text-xs">
+              Shared live with the Worker — both screens show identical numbers
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Wifi className="w-3.5 h-3.5" />Connected to
+                <Wifi className="w-3.5 h-3.5" />Connection Type
               </span>
-              <Badge variant="secondary">{connectedNetwork || 'Unknown'}</Badge>
+              <Badge variant="secondary">{fmtConnectionType(connectedNetwork)}</Badge>
             </div>
             <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Gauge className="w-3.5 h-3.5" />Data Used (this session)
+                <Gauge className="w-3.5 h-3.5" />Total Data Shared
               </span>
               <span className="text-sm font-mono font-semibold">{fmtBytes(dataUsed)}</span>
             </div>
