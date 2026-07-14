@@ -28,6 +28,7 @@ import {
   AlertCircle, Copy, Download, Terminal, Zap, Shield,
   ArrowRightLeft, Play, Square, Network, Activity,
   RefreshCw, Lock, FileCode2, Battery, SignalHigh, Gauge,
+  Film, X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { SignalClient } from '@/lib/signal';
@@ -60,6 +61,26 @@ interface TunnelStats {
 const NETWORK_PROVIDERS = ['Jio', 'Airtel', 'Vi', 'BSNL', 'Wi-Fi', 'Other'] as const;
 
 const NETWORK_STORAGE_KEY = 'netmesh:networkProvider';
+
+// ── Video performance test tiers ────────────────────────────────────────────
+// Real, CORS-enabled sample videos of increasing size, used to test tunnel
+// throughput at different bandwidths. Each is fetched by the Worker and
+// streamed to the Buyer over the RTCDataChannel in 16 KB pieces.
+
+interface VideoTier {
+  key: string;
+  label: string;
+  approxSize: string;
+  url: string;
+}
+
+const VIDEO_TIERS: VideoTier[] = [
+  { key: 'ultra-low', label: 'Ultra-Low', approxSize: '~0.8 MB', url: 'https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/rabbit320.mp4' },
+  { key: 'low',       label: 'Low',       approxSize: '~2.8 MB', url: 'https://download.samplelib.com/mp4/sample-5s.mp4' },
+  { key: 'medium',    label: 'Medium',    approxSize: '~10 MB',  url: 'https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4' },
+  { key: 'high',      label: 'High',      approxSize: '~21.6 MB', url: 'https://download.samplelib.com/mp4/sample-30s.mp4' },
+  { key: 'hd',        label: 'HD',        approxSize: '~23 MB',  url: 'https://vjs.zencdn.net/v/oceans.mp4' },
+];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -565,10 +586,26 @@ function BuyerTab() {
   const [connectedNetwork, setConnectedNetwork] = useState('');
   const [dataUsed, setDataUsed]   = useState(0);
 
+  // Video performance test — Buyer-only
+  const [activeTier, setActiveTier]   = useState<string | null>(null);
+  const [videoUrl, setVideoUrl]       = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] = useState<{ received: number; total: number } | null>(null);
+  const [videoError, setVideoError]   = useState<string | null>(null);
+
   const { logs, addLog, scrollRef } = useLogs();
 
   const signalRef = useRef<SignalClient | null>(null);
   const tunnelRef = useRef<WebRTCTunnel | null>(null);
+  const videoUrlRef = useRef<string | null>(null);
+
+  const clearVideo = useCallback(() => {
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+    videoUrlRef.current = null;
+    setVideoUrl(null);
+    setActiveTier(null);
+    setVideoProgress(null);
+    setVideoError(null);
+  }, []);
 
   const teardown = useCallback(() => {
     tunnelRef.current?.close();
@@ -577,7 +614,8 @@ function BuyerTab() {
     signalRef.current = null;
     setConnectedNetwork('');
     setDataUsed(0); // resets only here — i.e. only when the session actually disconnects
-  }, []);
+    clearVideo();
+  }, [clearVideo]);
 
   const connect = useCallback(async () => {
     const trimmed = code.trim().toUpperCase();
@@ -688,6 +726,32 @@ function BuyerTab() {
       setTesting(false);
     }
   }, [testUrl, phase, addLog]);
+
+  const runVideoTest = useCallback(async (tier: VideoTier) => {
+    if (!tunnelRef.current || phase !== 'connected') return;
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+    videoUrlRef.current = null;
+    setVideoUrl(null);
+    setVideoError(null);
+    setActiveTier(tier.key);
+    setVideoProgress({ received: 0, total: 0 });
+    addLog(`Video test [${tier.label}] → streaming via Worker's connection…`, 'info');
+
+    try {
+      const blob = await tunnelRef.current.fetchBinary(tier.url, (received, total) => {
+        setVideoProgress({ received, total });
+      });
+      const url = URL.createObjectURL(blob);
+      videoUrlRef.current = url;
+      setVideoUrl(url);
+      addLog(`Video test [${tier.label}] complete — ${fmtBytes(blob.size)} streamed through tunnel ✓`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setVideoError(msg);
+      setActiveTier(null);
+      addLog(`Video test [${tier.label}] failed: ${msg}`, 'error');
+    }
+  }, [phase, addLog]);
 
   const handleDownloadPAC = () => {
     const content = generatePAC('127.0.0.1', 1080, sessionId);
@@ -890,6 +954,106 @@ function BuyerTab() {
                 For Android: Settings → Wi-Fi → Proxy → Manual.
               </p>
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Video Performance Test — Buyer-only: streams real sample videos of
+          increasing size through the WebRTC tunnel to gauge throughput. */}
+      {isConnected && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Film className="w-3.5 h-3.5 text-primary" />
+              Video Performance Test
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Play a sample video at each quality tier to test the Worker's real bandwidth
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              {VIDEO_TIERS.map(tier => {
+                const isLoadingThis = activeTier === tier.key && !videoUrl && !videoError;
+                const isLoadingOther = activeTier !== null && activeTier !== tier.key && !videoUrl && !videoError;
+                return (
+                  <Button
+                    key={tier.key}
+                    size="sm"
+                    variant={activeTier === tier.key ? 'default' : 'outline'}
+                    className="flex flex-col h-auto py-2 gap-0.5"
+                    disabled={isLoadingOther}
+                    onClick={() => runVideoTest(tier)}
+                  >
+                    {isLoadingThis
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <span className="text-xs font-semibold">{tier.label}</span>}
+                    <span className="text-[10px] opacity-70">{tier.approxSize}</span>
+                  </Button>
+                );
+              })}
+            </div>
+
+            {/* Download progress while the tunnel is streaming the file */}
+            {activeTier && !videoUrl && !videoError && videoProgress && (
+              <div className="space-y-1.5">
+                <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{
+                      width: videoProgress.total > 0
+                        ? `${Math.min(100, (videoProgress.received / videoProgress.total) * 100)}%`
+                        : '15%',
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground font-mono">
+                  Streaming via tunnel… {fmtBytes(videoProgress.received)}
+                  {videoProgress.total > 0 && ` / ${fmtBytes(videoProgress.total)}`}
+                </p>
+              </div>
+            )}
+
+            {videoError && (
+              <div className="flex items-center gap-2 text-xs text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-md px-3 py-2">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>Stream failed: {videoError}</span>
+              </div>
+            )}
+
+            {videoUrl && (
+              <div className="space-y-2">
+                <div className="relative rounded-lg overflow-hidden border border-border bg-black">
+                  <video
+                    key={videoUrl}
+                    src={videoUrl}
+                    controls
+                    autoPlay
+                    className="w-full max-h-64"
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="absolute top-2 right-2 h-7 w-7 p-0"
+                    onClick={clearVideo}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </Button>
+                </div>
+                {/* Required label: makes explicit that playback is powered by the tunnel */}
+                <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs font-mono text-muted-foreground">
+                  Streaming Quality Test | Data being used from Worker's connection
+                  <div className="mt-0.5 text-foreground">
+                    Streaming via Worker: {connectedNetwork || "Unknown"}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <p className="text-xs text-muted-foreground">
+              Every byte of the video is fetched by the Worker and relayed to you over the
+              same encrypted DataChannel — it counts toward the Worker's data usage above.
+            </p>
           </CardContent>
         </Card>
       )}
