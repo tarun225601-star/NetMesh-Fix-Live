@@ -149,7 +149,7 @@ function WorkerTab() {
   const [sessionId, setSessionId] = useState('');
   const [copied, setCopied]       = useState(false);
   const [stats, setStats]         = useState<TunnelStats>({ requests: 0, bytes: 0, startedAt: null, uptime: '0s' });
-  const [keepAlive, setKeepAlive] = useState({ active: false, wakeLock: false });
+  const [keepAlive, setKeepAlive] = useState({ active: false, wakeLock: false, media: false, sw: false });
 
   const { logs, addLog, scrollRef } = useLogs();
 
@@ -177,7 +177,7 @@ function WorkerTab() {
     tunnelRef.current = null;
     signalRef.current?.close();
     signalRef.current = null;
-    setKeepAlive({ active: false, wakeLock: false });
+    setKeepAlive({ active: false, wakeLock: false, media: false, sw: false });
     if (uptimeRef.current) clearInterval(uptimeRef.current);
   }, []);
 
@@ -272,7 +272,7 @@ function WorkerTab() {
         const ka = new KeepAliveManager();
         keepAliveRef.current = ka;
         void ka.start(() => tunnel.ping()).then(() => {
-          setKeepAlive({ active: true, wakeLock: ka.hasWakeLock });
+          setKeepAlive({ active: true, wakeLock: ka.hasWakeLock, media: ka.hasMediaKeepAwake, sw: ka.hasServiceWorker });
         });
         const now = new Date();
         setStats(s => ({ ...s, startedAt: now }));
@@ -382,11 +382,17 @@ function WorkerTab() {
 
           {/* Keep-alive status */}
           {keepAlive.active && (
-            <div className="flex items-center gap-2 text-xs text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md px-3 py-2">
+            <div className="flex items-center gap-2 text-xs text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md px-3 py-2 flex-wrap">
               <Battery className="w-3.5 h-3.5" />
               <span>Keep-alive active — ping every 20 s</span>
               {keepAlive.wakeLock && (
                 <span className="ml-1 opacity-70">· Screen wake lock held</span>
+              )}
+              {keepAlive.media && (
+                <span className="ml-1 opacity-70">· Media keep-awake running</span>
+              )}
+              {keepAlive.sw && (
+                <span className="ml-1 opacity-70">· Background heartbeat registered</span>
               )}
             </div>
           )}
