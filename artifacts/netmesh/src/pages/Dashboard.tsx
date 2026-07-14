@@ -155,6 +155,60 @@ function PhaseBadge({ phase }: { phase: keyof typeof PHASE_META }) {
   );
 }
 
+// ── Smart Network Manager (Buyer) ───────────────────────────────────────────────
+// Drives the "which physical connection is actually carrying traffic" state
+// machine: stay on mobile data while the tunnel spins up, auto-switch to the
+// Worker's tunnel once it's genuinely live, and fail back to mobile data fast
+// if the tunnel ever drops.
+
+type SystemStatus = 'idle' | 'initializing' | 'tunnel-active' | 'failing-over' | 'fallback';
+
+const INIT_WINDOW_MS = 60_000;
+const FAILOVER_WINDOW_MS = 2_000;
+
+const SYSTEM_STATUS_META: Record<SystemStatus, { label: string; icon: React.ReactNode; cls: string }> = {
+  idle: {
+    label: 'System Status: Idle',
+    icon: <WifiOff className="w-3.5 h-3.5" />,
+    cls: 'bg-muted text-muted-foreground border-border',
+  },
+  initializing: {
+    label: 'System Status: Initializing...',
+    icon: <Loader2 className="w-3.5 h-3.5 animate-spin" />,
+    cls: 'bg-blue-50 text-blue-700 dark:bg-blue-950/30 dark:text-blue-400 border-blue-200 dark:border-blue-800',
+  },
+  'tunnel-active': {
+    label: 'System Status: Tunnel Active - Routing via Worker',
+    icon: <Shield className="w-3.5 h-3.5" />,
+    cls: 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400 border-green-200 dark:border-green-800',
+  },
+  'failing-over': {
+    label: 'System Status: Connection Lost - Reverting to Mobile Data...',
+    icon: <AlertCircle className="w-3.5 h-3.5 animate-pulse" />,
+    cls: 'bg-orange-50 text-orange-700 dark:bg-orange-950/30 dark:text-orange-400 border-orange-200 dark:border-orange-800',
+  },
+  fallback: {
+    label: 'System Status: Mobile Data (Fallback Active)',
+    icon: <SignalHigh className="w-3.5 h-3.5" />,
+    cls: 'bg-yellow-50 text-yellow-700 dark:bg-yellow-950/30 dark:text-yellow-400 border-yellow-200 dark:border-yellow-800',
+  },
+};
+
+function SystemStatusBanner({ status, proxyModeActive }: { status: SystemStatus; proxyModeActive: boolean }) {
+  if (status === 'idle') return null;
+  const m = SYSTEM_STATUS_META[status];
+  return (
+    <div className={cn('flex items-center justify-between gap-2 text-xs font-medium border rounded-md px-3 py-2', m.cls)}>
+      <span className="flex items-center gap-2">{m.icon}{m.label}</span>
+      {proxyModeActive && (
+        <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-green-600/10 text-green-700 dark:text-green-400 border border-green-600/30 shrink-0">
+          <Shield className="w-3 h-3" /> Active Proxy Mode
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── Log panel (shared) ────────────────────────────────────────────────────────
 
 const LOG_COLOR: Record<LogKind, string> = {
@@ -586,6 +640,17 @@ function BuyerTab() {
   const [connectedNetwork, setConnectedNetwork] = useState('');
   const [dataUsed, setDataUsed]   = useState(0);
 
+  // Smart network management — which physical connection is actually live
+  const [systemStatus, setSystemStatus]     = useState<SystemStatus>('idle');
+  const [proxyModeActive, setProxyModeActive] = useState(false);
+  const systemStatusRef    = useRef<SystemStatus>('idle');
+  const proxyModeActiveRef = useRef(false);
+  const initTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const failoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => { systemStatusRef.current = systemStatus; }, [systemStatus]);
+  useEffect(() => { proxyModeActiveRef.current = proxyModeActive; }, [proxyModeActive]);
+
   // Video performance test — Buyer-only
   const [activeTier, setActiveTier]   = useState<string | null>(null);
   const [videoUrl, setVideoUrl]       = useState<string | null>(null);
@@ -607,7 +672,14 @@ function BuyerTab() {
     setVideoError(null);
   }, []);
 
-  const teardown = useCallback(() => {
+  const clearNetworkTimers = useCallback(() => {
+    if (initTimerRef.current)     { clearTimeout(initTimerRef.current);     initTimerRef.current = null; }
+    if (failoverTimerRef.current) { clearTimeout(failoverTimerRef.current); failoverTimerRef.current = null; }
+  }, []);
+
+  /** Closes the tunnel/signal sockets and resets connection-derived UI state,
+   *  without touching systemStatus — callers decide what status to land on. */
+  const cleanupConnections = useCallback(() => {
     tunnelRef.current?.close();
     tunnelRef.current = null;
     signalRef.current?.close();
@@ -616,6 +688,36 @@ function BuyerTab() {
     setDataUsed(0); // resets only here — i.e. only when the session actually disconnects
     clearVideo();
   }, [clearVideo]);
+
+  const teardown = useCallback(() => {
+    clearNetworkTimers();
+    cleanupConnections();
+    setProxyModeActive(false);
+    setSystemStatus('idle');
+  }, [cleanupConnections, clearNetworkTimers]);
+
+  /** Smart Failover: the tunnel dropped unexpectedly. If traffic was actively
+   *  routing through the Worker (Active Proxy mode), fail back to local mobile
+   *  data within ~2 seconds so the user never loses connectivity for long. If
+   *  the drop happens before the switch ever occurred, there's nothing to fail
+   *  back from — mobile data was never interrupted, so just go idle. */
+  const handleTunnelDrop = useCallback(() => {
+    clearNetworkTimers();
+    if (proxyModeActiveRef.current) {
+      setSystemStatus('failing-over');
+      addLog('Tunnel dropped — smart failover engaged, reverting to mobile data…', 'warn');
+      failoverTimerRef.current = setTimeout(() => {
+        cleanupConnections();
+        setProxyModeActive(false);
+        setSystemStatus('fallback');
+        addLog('Reverted to local mobile internet — connectivity restored ✓', 'success');
+      }, FAILOVER_WINDOW_MS);
+    } else {
+      cleanupConnections();
+      setProxyModeActive(false);
+      setSystemStatus('idle');
+    }
+  }, [addLog, cleanupConnections, clearNetworkTimers]);
 
   const connect = useCallback(async () => {
     const trimmed = code.trim().toUpperCase();
@@ -627,6 +729,17 @@ function BuyerTab() {
     setTestResult(null);
     addLog(`Connecting to session ${trimmed}…`, 'info');
 
+    // Initialization Phase — stay on mobile data for up to 60s (or until the
+    // handshake completes, whichever comes first) so configs/signaling can
+    // settle without disrupting the user's connectivity.
+    setSystemStatus('initializing');
+    addLog('Initialization phase started — remaining on mobile data for up to 60s while the tunnel is established…', 'info');
+    initTimerRef.current = setTimeout(() => {
+      if (systemStatusRef.current === 'initializing') {
+        addLog('Initialization window (60s) elapsed — handshake still in progress, staying on mobile data…', 'warn');
+      }
+    }, INIT_WINDOW_MS);
+
     const signal = new SignalClient();
     signalRef.current = signal;
 
@@ -635,6 +748,7 @@ function BuyerTab() {
     } catch {
       addLog('Cannot reach signaling server — is the API server running?', 'error');
       setPhase('failed');
+      handleTunnelDrop();
       return;
     }
 
@@ -645,11 +759,17 @@ function BuyerTab() {
       if (p === 'connected') {
         setPhase('connected');
         addLog('Tunnel is live — traffic routing through Worker ✓', 'success');
+        // Auto-Switch Trigger: Tunnel Live + DataChannel ready → engage Active Proxy mode.
+        clearNetworkTimers();
+        setProxyModeActive(true);
+        setSystemStatus('tunnel-active');
+        addLog('Auto-switch engaged — Active Proxy mode is now routing traffic via the Worker ✓', 'success');
       } else if (p === 'connecting') {
         setPhase('connecting');
       } else if (p === 'failed' || p === 'closed') {
         setPhase(p);
         addLog(`Tunnel ${p}`, 'warn');
+        handleTunnelDrop();
       }
     };
     tunnel.onLog = addLog;
@@ -688,21 +808,22 @@ function BuyerTab() {
       if (msg.type === 'worker-disconnected') {
         addLog('Worker disconnected', 'warn');
         setPhase('closed');
-        teardown();
+        handleTunnelDrop();
         return;
       }
 
       if (msg.type === 'error') {
         addLog(`Error: ${msg.message as string}`, 'error');
         setPhase('failed');
-        teardown();
+        handleTunnelDrop();
       }
     });
 
     signal.onClose(() => addLog('Signaling connection closed', 'warn'));
-  }, [code, phase, teardown, addLog]);
+  }, [code, phase, teardown, handleTunnelDrop, addLog]);
 
   const disconnect = useCallback(() => {
+    // User-initiated — no failover needed, drop straight back to idle.
     teardown();
     setPhase('idle');
     setSessionId('');
@@ -814,6 +935,10 @@ function BuyerTab() {
               </Button>
             )}
           </div>
+
+          {/* Smart Network Manager status — visible from the moment Connect is
+              clicked (Initializing) through Tunnel Active, failover, and fallback. */}
+          <SystemStatusBanner status={systemStatus} proxyModeActive={proxyModeActive} />
 
           {/* Connected state: tunnel active indicator */}
           {isConnected && (
