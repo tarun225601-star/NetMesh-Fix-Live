@@ -73,11 +73,16 @@ export class WebRTCTunnel {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private pending = new Map<string, (r: ProxyResponse) => void>();
+  private statsTimer: ReturnType<typeof setInterval> | null = null;
 
   // Callbacks set by the consumer
   onPhaseChange: (phase: TunnelPhase) => void = () => {};
   onLog: (msg: string, kind: LogKind) => void = () => {};
   onStats: (delta: { requests: number; bytes: number }) => void = () => {};
+  /** Cumulative bytes transferred over the RTCDataChannel this session, from getStats(). */
+  onDataUsage: (totalBytes: number) => void = () => {};
+  /** Fired when the remote peer announces its network provider name. */
+  onNetworkInfo: (provider: string) => void = () => {};
 
   // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -114,11 +119,13 @@ export class WebRTCTunnel {
     dc.onopen = () => {
       this.setPhase("connected");
       this.log("Data channel open — tunnel live ✓", "success");
+      this.startStatsPolling();
     };
 
     dc.onclose = () => {
       this.setPhase("closed");
       this.log("Data channel closed", "warn");
+      this.stopStatsPolling();
     };
 
     dc.onerror = (e) => {
@@ -126,6 +133,56 @@ export class WebRTCTunnel {
     };
 
     dc.onmessage = (e) => this.dispatch(e.data as string);
+  }
+
+  // ── Live data-usage tracking via WebRTC getStats() ──────────────────────────
+
+  private startStatsPolling() {
+    if (this.statsTimer) return;
+    void this.pollStats(); // immediate first read
+    this.statsTimer = setInterval(() => void this.pollStats(), 2_000);
+  }
+
+  private stopStatsPolling() {
+    if (this.statsTimer !== null) clearInterval(this.statsTimer);
+    this.statsTimer = null;
+  }
+
+  private async pollStats() {
+    if (!this.pc) return;
+    try {
+      const report = await this.pc.getStats();
+      let dataChannelBytes = 0;
+      let candidatePairBytes = 0;
+
+      report.forEach((stat) => {
+        // Prefer exact RTCDataChannel byte counters — these reflect only the
+        // application-level tunnel traffic, not STUN/ICE keepalive overhead.
+        if (stat.type === "data-channel") {
+          const s = stat as unknown as { bytesSent?: number; bytesReceived?: number };
+          dataChannelBytes += (s.bytesSent ?? 0) + (s.bytesReceived ?? 0);
+        }
+        // Fallback: the currently selected ICE candidate pair's total
+        // transport bytes, used only if data-channel stats aren't reported
+        // by this browser.
+        if (stat.type === "candidate-pair" && (stat as RTCIceCandidatePairStats).state === "succeeded") {
+          const s = stat as unknown as { bytesSent?: number; bytesReceived?: number };
+          candidatePairBytes += (s.bytesSent ?? 0) + (s.bytesReceived ?? 0);
+        }
+      });
+
+      const total = dataChannelBytes > 0 ? dataChannelBytes : candidatePairBytes;
+      this.onDataUsage(total);
+    } catch {
+      // getStats() can throw transiently during ICE renegotiation — ignore.
+    }
+  }
+
+  /** Worker → Buyer: announce which mobile/ISP network is relaying traffic. */
+  sendNetworkInfo(provider: string) {
+    if (this.dc?.readyState === "open") {
+      this.dc.send(JSON.stringify({ type: "network-info", provider }));
+    }
   }
 
   private dispatch(raw: string) {
@@ -158,6 +215,11 @@ export class WebRTCTunnel {
         this.pending.delete(r.id);
         resolve(r);
       }
+      return;
+    }
+
+    if (type === "network-info") {
+      this.onNetworkInfo((msg as unknown as { provider: string }).provider);
     }
   }
 
@@ -313,6 +375,7 @@ export class WebRTCTunnel {
   }
 
   close() {
+    this.stopStatsPolling();
     this.pending.clear();
     try { this.dc?.close(); } catch { /* ignore */ }
     try { this.pc?.close(); } catch { /* ignore */ }

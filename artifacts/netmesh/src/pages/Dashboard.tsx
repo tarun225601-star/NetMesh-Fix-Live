@@ -22,11 +22,12 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Wifi, WifiOff, Radio, Globe, Loader2, CheckCircle2,
   AlertCircle, Copy, Download, Terminal, Zap, Shield,
   ArrowRightLeft, Play, Square, Network, Activity,
-  RefreshCw, Lock, FileCode2, Battery,
+  RefreshCw, Lock, FileCode2, Battery, SignalHigh, Gauge,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { SignalClient } from '@/lib/signal';
@@ -49,6 +50,16 @@ interface TunnelStats {
   startedAt: Date | null;
   uptime: string;
 }
+
+// ── Network providers ─────────────────────────────────────────────────────────
+// Browsers do not expose the actual mobile carrier name to web pages (no
+// public API for this, for privacy reasons) — so the Worker selects their
+// own network from this list, and it's announced to the Buyer once the
+// tunnel is live.
+
+const NETWORK_PROVIDERS = ['Jio', 'Airtel', 'Vi', 'BSNL', 'Wi-Fi', 'Other'] as const;
+
+const NETWORK_STORAGE_KEY = 'netmesh:networkProvider';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -150,13 +161,21 @@ function WorkerTab() {
   const [copied, setCopied]       = useState(false);
   const [stats, setStats]         = useState<TunnelStats>({ requests: 0, bytes: 0, startedAt: null, uptime: '0s' });
   const [keepAlive, setKeepAlive] = useState({ active: false, wakeLock: false, media: false, sw: false });
+  const [networkProvider, setNetworkProvider] = useState(() => localStorage.getItem(NETWORK_STORAGE_KEY) ?? 'Jio');
+  const [dataUsed, setDataUsed]   = useState(0);
 
   const { logs, addLog, scrollRef } = useLogs();
 
-  const signalRef    = useRef<SignalClient | null>(null);
-  const tunnelRef    = useRef<WebRTCTunnel | null>(null);
-  const keepAliveRef = useRef<KeepAliveManager | null>(null);
-  const uptimeRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const signalRef         = useRef<SignalClient | null>(null);
+  const tunnelRef         = useRef<WebRTCTunnel | null>(null);
+  const keepAliveRef      = useRef<KeepAliveManager | null>(null);
+  const uptimeRef         = useRef<ReturnType<typeof setInterval> | null>(null);
+  const networkProviderRef = useRef(networkProvider);
+
+  useEffect(() => {
+    networkProviderRef.current = networkProvider;
+    localStorage.setItem(NETWORK_STORAGE_KEY, networkProvider);
+  }, [networkProvider]);
 
   // Live uptime ticker
   useEffect(() => {
@@ -178,6 +197,7 @@ function WorkerTab() {
     signalRef.current?.close();
     signalRef.current = null;
     setKeepAlive({ active: false, wakeLock: false, media: false, sw: false });
+    setDataUsed(0); // resets only here — i.e. only when the session actually disconnects
     if (uptimeRef.current) clearInterval(uptimeRef.current);
   }, []);
 
@@ -276,6 +296,8 @@ function WorkerTab() {
         });
         const now = new Date();
         setStats(s => ({ ...s, startedAt: now }));
+        // Announce our network provider to the Buyer now that the tunnel is live.
+        tunnel.sendNetworkInfo(networkProviderRef.current);
       }
       if (p === 'connected') setPhase('connected');
       else if (p === 'connecting') setPhase('connecting');
@@ -289,6 +311,7 @@ function WorkerTab() {
         bytes: s.bytes + delta.bytes,
       }));
     };
+    tunnel.onDataUsage = (totalBytes) => setDataUsed(totalBytes);
 
     signal.onClose(() => {
       addLog('Signaling connection closed', 'warn');
@@ -342,6 +365,26 @@ function WorkerTab() {
                 Stop Worker
               </Button>
             )}
+          </div>
+
+          {/* Network provider selector */}
+          <div className="rounded-lg border border-border p-4 space-y-2">
+            <p className="text-xs text-muted-foreground font-medium uppercase tracking-wider">
+              Your Network Provider
+            </p>
+            <Select value={networkProvider} onValueChange={setNetworkProvider}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select your network" />
+              </SelectTrigger>
+              <SelectContent>
+                {NETWORK_PROVIDERS.map(p => (
+                  <SelectItem key={p} value={p}>{p}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Shown to the Buyer once connected, since they'll be using your mobile data.
+            </p>
           </div>
 
           {/* Session code */}
@@ -399,6 +442,35 @@ function WorkerTab() {
         </CardContent>
       </Card>
 
+      {/* Network Monitor */}
+      {phase === 'connected' && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <SignalHigh className="w-3.5 h-3.5 text-muted-foreground" />
+              Network Monitor
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Wifi className="w-3.5 h-3.5" />Relaying on
+              </span>
+              <Badge variant="secondary">{networkProvider}</Badge>
+            </div>
+            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Gauge className="w-3.5 h-3.5" />Data Used (this session)
+              </span>
+              <span className="text-sm font-mono font-semibold">{fmtBytes(dataUsed)}</span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Measured live from the WebRTC connection — resets only when the Worker stops or the Buyer disconnects.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Live log */}
       <Card>
         <CardHeader className="pb-2">
@@ -441,6 +513,8 @@ function BuyerTab() {
   const [testResult, setTestResult] = useState<{ status: number; body: string } | null>(null);
   const [testing, setTesting]     = useState(false);
   const [sessionId, setSessionId] = useState('');
+  const [connectedNetwork, setConnectedNetwork] = useState('');
+  const [dataUsed, setDataUsed]   = useState(0);
 
   const { logs, addLog, scrollRef } = useLogs();
 
@@ -452,6 +526,8 @@ function BuyerTab() {
     tunnelRef.current = null;
     signalRef.current?.close();
     signalRef.current = null;
+    setConnectedNetwork('');
+    setDataUsed(0); // resets only here — i.e. only when the session actually disconnects
   }, []);
 
   const connect = useCallback(async () => {
@@ -490,6 +566,11 @@ function BuyerTab() {
       }
     };
     tunnel.onLog = addLog;
+    tunnel.onDataUsage = (totalBytes) => setDataUsed(totalBytes);
+    tunnel.onNetworkInfo = (provider) => {
+      setConnectedNetwork(provider);
+      addLog(`Connected to network: ${provider}`, 'info');
+    };
 
     signal.onMessage(async (msg) => {
       if (msg.type === 'joined') {
@@ -629,8 +710,47 @@ function BuyerTab() {
               <span className="opacity-70">· HTTP traffic routing through Worker · Session {sessionId}</span>
             </div>
           )}
+
+          {/* Connected-to network label */}
+          {isConnected && (
+            <div className="flex items-center gap-2 text-xs font-medium text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-md px-3 py-2">
+              <SignalHigh className="w-3.5 h-3.5" />
+              <span>Connected to: {connectedNetwork || 'Awaiting network info…'}</span>
+              <span className="opacity-70 font-normal">— you're using the Worker's mobile data</span>
+            </div>
+          )}
         </CardContent>
       </Card>
+
+      {/* Network Monitor */}
+      {isConnected && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <SignalHigh className="w-3.5 h-3.5 text-muted-foreground" />
+              Network Monitor
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Wifi className="w-3.5 h-3.5" />Connected to
+              </span>
+              <Badge variant="secondary">{connectedNetwork || 'Unknown'}</Badge>
+            </div>
+            <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Gauge className="w-3.5 h-3.5" />Data Used (this session)
+              </span>
+              <span className="text-sm font-mono font-semibold">{fmtBytes(dataUsed)}</span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Live from the WebRTC connection — this counts against the Worker's mobile data plan.
+              Resets only when you disconnect.
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Test request panel — shown only when connected */}
       {isConnected && (
