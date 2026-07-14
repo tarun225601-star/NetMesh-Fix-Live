@@ -182,11 +182,33 @@ function WorkerTab() {
   const keepAliveRef      = useRef<KeepAliveManager | null>(null);
   const uptimeRef         = useRef<ReturnType<typeof setInterval> | null>(null);
   const networkProviderRef = useRef(networkProvider);
+  const dataUsedRef       = useRef(0);
+  const logTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     networkProviderRef.current = networkProvider;
     localStorage.setItem(NETWORK_STORAGE_KEY, networkProvider);
   }, [networkProvider]);
+
+  // Keep a ref mirror of dataUsed so the 5s log ticker always reads the
+  // latest value without needing to be recreated on every update.
+  useEffect(() => {
+    dataUsedRef.current = dataUsed;
+  }, [dataUsed]);
+
+  // Print a running data-usage line into the Worker Log every 5 seconds
+  // while the tunnel is live, e.g. "14:40:05  Data usage: 50.00 MB".
+  useEffect(() => {
+    if (phase === 'connected') {
+      logTimerRef.current = setInterval(() => {
+        addLog(`Data usage: ${fmtMB(dataUsedRef.current)} MB`, 'info');
+      }, 5_000);
+    } else if (logTimerRef.current) {
+      clearInterval(logTimerRef.current);
+      logTimerRef.current = null;
+    }
+    return () => { if (logTimerRef.current) clearInterval(logTimerRef.current); };
+  }, [phase, addLog]);
 
   // Live uptime ticker
   useEffect(() => {
@@ -485,6 +507,16 @@ function WorkerTab() {
         </Card>
       )}
 
+      {/* Total Data Used — small always-visible box above the log */}
+      {phase === 'connected' && (
+        <div className="flex items-center justify-between rounded-lg border border-border bg-muted/30 px-4 py-2.5">
+          <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            <Gauge className="w-3.5 h-3.5" />Total Data Used
+          </span>
+          <span className="text-base font-mono font-bold text-primary">{fmtBytes(dataUsed)}</span>
+        </div>
+      )}
+
       {/* Live log */}
       <Card>
         <CardHeader className="pb-2">
@@ -492,6 +524,9 @@ function WorkerTab() {
             <Terminal className="w-3.5 h-3.5 text-muted-foreground" />
             Worker Log
           </CardTitle>
+          <CardDescription className="text-xs">
+            Logs a running data-usage line every 5 seconds while the tunnel is live
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <LogPanel logs={logs} scrollRef={scrollRef} />
