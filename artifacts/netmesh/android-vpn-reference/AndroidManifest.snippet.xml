@@ -1,0 +1,36 @@
+<!--
+  Merge these into app/src/main/AndroidManifest.xml.
+  This is a snippet, not a standalone manifest.
+-->
+
+<!-- Permissions -->
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<!-- Required on Android 14+ (API 34) for a foreground service of type "specialUse"
+     when no closer-matching foreground service type applies to VPN. -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+<application>
+
+    <activity
+        android:name=".MainActivity"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+    </activity>
+
+    <!-- The VpnService itself. android:permission + the intent-filter action
+         are both required by the Android framework for VpnService to bind. -->
+    <service
+        android:name=".NetMeshVpnService"
+        android:permission="android.permission.BIND_VPN_SERVICE"
+        android:exported="false"
+        android:foregroundServiceType="specialUse">
+        <intent-filter>
+            <action android:name="android.net.VpnService" />
+        </intent-filter>
+    </service>
+
+</application>
