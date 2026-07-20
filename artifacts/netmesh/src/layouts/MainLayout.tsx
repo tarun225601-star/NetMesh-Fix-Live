@@ -1,4 +1,4 @@
-import { Link, useLocation } from "wouter";
+import { Link, useLocation } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -28,12 +28,10 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
       {/* Brand */}
       <div className="flex items-center justify-between px-6 h-16 border-b border-sidebar-border shrink-0">
         <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-md bg-primary flex items-center justify-center">
-            <Share2 className="w-4 h-4 text-primary-foreground" />
+          <div className="w-7 h-7 rounded-md bg-primary flex items-center justify-center text-primary-foreground">
+            <Share2 className="w-4 h-4" />
           </div>
-          <span className="font-semibold text-sidebar-foreground tracking-tight text-sm">
-            NetMesh
-          </span>
+          <span className="font-semibold tracking-tight text-sm">NetMesh</span>
         </div>
         {onClose && (
           <Button
@@ -48,7 +46,7 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
       </div>
 
       {/* Nav links */}
-      <div className="flex-1 overflow-y-auto px-3 py-4 space-y-1">
+      <div className="flex-1 overflow-y-auto py-6 px-4 space-y-1">
         {navItems.map(({ href, label, icon: Icon }) => {
           const active = location === href;
           return (
@@ -57,13 +55,13 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
               href={href}
               onClick={onClose}
               className={cn(
-                "flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors",
+                "flex items-center gap-3 px-4 py-2 rounded-md text-sm font-medium transition-colors",
                 active
-                  ? "bg-sidebar-primary text-sidebar-primary-foreground"
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
                   : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
               )}
             >
-              <Icon className="w-4 h-4 shrink-0" />
+              <Icon className="w-4 h-4" />
               {label}
             </Link>
           );
@@ -71,18 +69,15 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
       </div>
 
       {/* Footer */}
-      /* Footer */
-<div className="px-6 py-4 border-t border-border">
-  <div style={{ display: 'flex', gap: '20px', justifyContent: 'center' }}>
-    <a href="https://www.youtube.com" target="_blank" rel="noopener noreferrer">
-      <img src="https://cdn-icons-png.flaticon.com/512/1384/1384060.png" alt="YouTube" style={{ width: '30px', height: '30px' }} />
-    </a>
-    <a href="https://www.instagram.com" target="_blank" rel="noopener noreferrer">
-      <img src="https://cdn-icons-png.flaticon.com/512/1384/1384063.png" alt="Instagram" style={{ width: '30px', height: '30px' }} />
-    </a>
-  </div>
-
-
+      <div className="px-6 py-4 border-t border-sidebar-border">
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '20px' }}>
+          <a href="https://www.youtube.com" target="_blank" rel="noopener noreferrer">
+            <img src="https://cdn-icons-png.flaticon.com/512/1384/1384060.png" alt="YouTube" width="30" height="30" />
+          </a>
+          <a href="https://www.instagram.com" target="_blank" rel="noopener noreferrer">
+            <img src="https://cdn-icons-png.flaticon.com/512/1384/1384063.png" alt="Instagram" width="30" height="30" />
+          </a>
+        </div>
       </div>
     </nav>
   );
@@ -118,7 +113,7 @@ export default function MainLayout({
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Mobile top bar */}
-        <header className="lg:hidden flex items-center gap-3 px-4 h-14 border-b border-border shrink-0">
+        <header className="lg:hidden flex items-center gap-3 px-4 h-14 border-b border-sidebar-border">
           <Button
             variant="ghost"
             size="icon"
