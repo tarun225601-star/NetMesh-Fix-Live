@@ -8,7 +8,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
         {children}
       </main>
       
-      {/* Footer Area with YouTube & Instagram Buttons */}
+      {/* Footer Area with Social Buttons */}
       <footer style={{ 
         padding: '20px', 
         display: 'flex', 
