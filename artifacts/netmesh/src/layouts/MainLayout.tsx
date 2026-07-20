@@ -71,8 +71,18 @@ function Sidebar({ onClose }: { onClose?: () => void }) {
       </div>
 
       {/* Footer */}
-      <div className="px-6 py-4 border-t border-sidebar-border text-xs text-muted-foreground">
-        NetMesh &copy; {new Date().getFullYear()}
+      /* Footer */
+<div className="px-6 py-4 border-t border-border">
+  <div style={{ display: 'flex', gap: '20px', justifyContent: 'center' }}>
+    <a href="https://www.youtube.com" target="_blank" rel="noopener noreferrer">
+      <img src="https://cdn-icons-png.flaticon.com/512/1384/1384060.png" alt="YouTube" style={{ width: '30px', height: '30px' }} />
+    </a>
+    <a href="https://www.instagram.com" target="_blank" rel="noopener noreferrer">
+      <img src="https://cdn-icons-png.flaticon.com/512/1384/1384063.png" alt="Instagram" style={{ width: '30px', height: '30px' }} />
+    </a>
+  </div>
+
+
       </div>
     </nav>
   );
